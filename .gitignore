@@ -6,6 +6,7 @@
 # Certificates, config, and chain indexes stay on that machine.
 chia-root/
 height-to-hash
+sub-epoch-summaries
 .ruff_cache/
 
 
