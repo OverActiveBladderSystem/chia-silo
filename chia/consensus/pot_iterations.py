@@ -1,0 +1,122 @@
+from __future__ import annotations
+
+from chia_rs import ConsensusConstants, PlotParam, ProofOfSpace
+from chia_rs.sized_bytes import bytes32
+from chia_rs.sized_ints import uint8, uint32, uint64
+
+from chia.consensus.pos_quality import _expected_plot_size
+from chia.types.blockchain_format.proof_of_space import (
+    calculate_base_plot_filter_bits,
+    calculate_plot_filter_bits,
+    verify_and_get_quality_string,
+)
+from chia.util.hash import std_hash
+
+
+def is_overflow_block(constants: ConsensusConstants, signage_point_index: uint8) -> bool:
+    if signage_point_index >= constants.NUM_SPS_SUB_SLOT:
+        raise ValueError("SP index too high")
+    return signage_point_index >= constants.NUM_SPS_SUB_SLOT - constants.NUM_SP_INTERVALS_EXTRA
+
+
+def calculate_sp_interval_iters(constants: ConsensusConstants, sub_slot_iters: uint64) -> uint64:
+    assert sub_slot_iters % constants.NUM_SPS_SUB_SLOT == 0
+    return uint64(sub_slot_iters // constants.NUM_SPS_SUB_SLOT)
+
+
+def calculate_sp_iters(constants: ConsensusConstants, sub_slot_iters: uint64, signage_point_index: uint8) -> uint64:
+    if signage_point_index >= constants.NUM_SPS_SUB_SLOT:
+        raise ValueError("SP index too high")
+    return uint64(calculate_sp_interval_iters(constants, sub_slot_iters) * signage_point_index)
+
+
+def calculate_ip_iters(
+    constants: ConsensusConstants,
+    sub_slot_iters: uint64,
+    signage_point_index: uint8,
+    required_iters: uint64,
+) -> uint64:
+    # Note that the SSI is for the block passed in, which might be in the previous epoch
+    sp_iters = calculate_sp_iters(constants, sub_slot_iters, signage_point_index)
+    sp_interval_iters: uint64 = calculate_sp_interval_iters(constants, sub_slot_iters)
+    if sp_iters % sp_interval_iters != 0 or sp_iters >= sub_slot_iters:
+        raise ValueError(f"Invalid sp iters {sp_iters} for this ssi {sub_slot_iters}")
+
+    if required_iters >= sp_interval_iters or required_iters == 0:
+        raise ValueError(
+            f"Required iters {required_iters} is not below the sp interval iters {sp_interval_iters} "
+            f"{sub_slot_iters} or not >0."
+        )
+
+    return uint64((sp_iters + constants.NUM_SP_INTERVALS_EXTRA * sp_interval_iters + required_iters) % sub_slot_iters)
+
+
+def validate_pospace_and_get_required_iters(
+    constants: ConsensusConstants,
+    proof_of_space: ProofOfSpace,
+    challenge: bytes32,
+    cc_sp_hash: bytes32,
+    height: uint32,
+    difficulty: uint64,
+    prev_transaction_block_height: uint32,  # this is the height of the last tx block before the current block SP
+    height_agnostic: bool = False,
+    filter_challenge: bytes32 | None = None,
+    signage_point_index: int | None = None,
+) -> uint64 | None:
+    q_str: bytes32 | None = verify_and_get_quality_string(
+        proof_of_space,
+        constants,
+        challenge,
+        cc_sp_hash,
+        height=height,
+        prev_transaction_block_height=prev_transaction_block_height,
+        height_agnostic=height_agnostic,
+        filter_challenge=filter_challenge,
+        signage_point_index=signage_point_index,
+    )
+    if q_str is None:
+        return None
+
+    return calculate_iterations_quality(
+        constants,
+        q_str,
+        proof_of_space.param(),
+        difficulty,
+        cc_sp_hash,
+        height=prev_transaction_block_height,
+    )
+
+
+def calculate_iterations_quality(
+    constants: ConsensusConstants,
+    quality_string: bytes32,
+    size: PlotParam,
+    difficulty: uint64,
+    cc_sp_output_hash: bytes32,
+    *,
+    height: uint32,
+) -> uint64:
+    """
+    Calculates the number of iterations from the quality. This is derives as the difficulty times the constant factor
+    times a random number between 0 and 1 (based on quality string), divided by plot size.
+    """
+
+    sp_quality_string: bytes32 = std_hash(quality_string + cc_sp_output_hash)
+    expected_size = _expected_plot_size(size, constants)
+    if size.strength_v2 is not None:
+        # V2 strength compensation: a plot that passes the filter less often (higher
+        # strength) must be proportionally more likely to be eligible, so all strengths
+        # win blocks at the same rate per physical byte. The factor mirrors the filter
+        # exactly: 2^(effective_filter_bits - base_filter_bits), which auto-caps at the
+        # 8192 cap (effective_filter_bits is capped at 13). With this, pass_probability
+        # x eligibility stays at 1/2^base for every strength.
+        base_bits = calculate_base_plot_filter_bits(height, constants)
+        effective_bits = calculate_plot_filter_bits(height, constants, size.strength_v2)
+        expected_size = uint64(int(expected_size) << (effective_bits - base_bits))
+    iters = uint64(
+        int(difficulty)
+        * int(constants.DIFFICULTY_CONSTANT_FACTOR)
+        * int.from_bytes(sp_quality_string, "big", signed=False)
+        // (int(pow(2, 256)) * int(expected_size))
+    )
+    return max(iters, uint64(1))

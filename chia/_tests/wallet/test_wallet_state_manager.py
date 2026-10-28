@@ -1,0 +1,1022 @@
+from __future__ import annotations
+
+import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from types import SimpleNamespace
+from typing import cast
+
+import anyio
+import pytest
+from chia_rs import CoinState, G2Element
+from chia_rs.sized_bytes import bytes32
+from chia_rs.sized_ints import uint32, uint64
+from pytest_mock import MockerFixture
+
+from chia._tests.conftest import ConsensusMode
+from chia._tests.environments.wallet import WalletStateTransition, WalletTestFramework
+from chia._tests.util.setup_nodes import OldSimulatorsAndWallets
+from chia._tests.util.time_out_assert import time_out_assert
+from chia.cmds.wallet import GetDerivationIndexCMD, UpdateDerivationIndexCMD
+from chia.data_layer.data_layer_wallet import DataLayerWallet
+from chia.protocols.outbound_message import NodeType
+from chia.types.blockchain_format.coin import Coin
+from chia.types.blockchain_format.program import Program
+from chia.types.coin_spend import make_spend
+from chia.types.peer_info import PeerInfo
+from chia.util.timing import adjusted_timeout
+from chia.wallet import wallet_state_manager as wsm_mod
+from chia.wallet.derivation_record import DerivationRecord
+from chia.wallet.derive_keys import master_sk_to_wallet_sk, master_sk_to_wallet_sk_unhardened
+from chia.wallet.nft_wallet import nft_wallet as nft_wallet_mod
+from chia.wallet.nft_wallet.nft_wallet import NFTWallet
+from chia.wallet.nft_wallet.uncurry_nft import NFTCoinData, UncurriedNFT
+from chia.wallet.remote_wallet.remote_wallet import RemoteWallet
+from chia.wallet.singleton import SINGLETON_LAUNCHER_PUZZLE_HASH
+from chia.wallet.transaction_record import TransactionRecord
+from chia.wallet.util.transaction_type import TransactionType
+from chia.wallet.util.wallet_types import WalletType
+from chia.wallet.wallet_coin_record import WalletCoinRecord
+from chia.wallet.wallet_request_types import (
+    CreateNewWallet,
+    CreateNewWalletType,
+    ExtendDerivationIndex,
+    GetCoinRecordsByNames,
+    GetHeightInfo,
+    GetHeightInfoResponse,
+    GetPuzzleAndSolution,
+    GetPuzzleAndSolutionResponse,
+    GetSpendableCoins,
+    GetWalletBalance,
+    PushTransactions,
+    SelectCoins,
+)
+from chia.wallet.wallet_rpc_api import MAX_DERIVATION_INDEX_DELTA
+from chia.wallet.wallet_spend_bundle import WalletSpendBundle
+from chia.wallet.wallet_state_manager import SyncStatus, WalletStateManager
+
+
+@asynccontextmanager
+async def assert_sync_mode(wallet_state_manager: WalletStateManager, target_height: uint32) -> AsyncIterator[None]:
+    assert not wallet_state_manager.lock.locked()
+    assert not wallet_state_manager.sync_mode
+    assert wallet_state_manager.sync_target is None
+    new_current_height = max(0, target_height - 1)
+    await wallet_state_manager.blockchain.set_finished_sync_up_to(new_current_height)
+    async with wallet_state_manager.set_sync_mode(target_height) as current_height:
+        assert current_height == new_current_height
+        assert wallet_state_manager.sync_mode
+        assert wallet_state_manager.lock.locked()
+        assert wallet_state_manager.sync_target == target_height
+        yield
+    assert not wallet_state_manager.lock.locked()
+    assert not wallet_state_manager.sync_mode
+    assert wallet_state_manager.sync_target is None
+
+
+@pytest.mark.limit_consensus_modes(allowed=[ConsensusMode.HARD_FORK_2_0])
+@pytest.mark.anyio
+async def test_set_sync_mode(simulator_and_wallet: OldSimulatorsAndWallets) -> None:
+    _, [(wallet_node, _)], _ = simulator_and_wallet
+    async with assert_sync_mode(wallet_node.wallet_state_manager, uint32(1)):
+        pass
+    async with assert_sync_mode(wallet_node.wallet_state_manager, uint32(22)):
+        pass
+    async with assert_sync_mode(wallet_node.wallet_state_manager, uint32(333)):
+        pass
+
+
+@pytest.mark.limit_consensus_modes(allowed=[ConsensusMode.HARD_FORK_2_0])
+@pytest.mark.anyio
+async def test_set_sync_mode_exception(simulator_and_wallet: OldSimulatorsAndWallets) -> None:
+    _, [(wallet_node, _)], _ = simulator_and_wallet
+    async with assert_sync_mode(wallet_node.wallet_state_manager, uint32(1)):
+        raise Exception
+
+
+@pytest.mark.limit_consensus_modes(allowed=[ConsensusMode.HARD_FORK_2_0])
+@pytest.mark.anyio
+async def test_create_dl_wallet_during_sync(
+    simulator_and_wallet: OldSimulatorsAndWallets,
+    self_hostname: str,
+    mocker: MockerFixture,
+) -> None:
+    full_nodes, [(wallet_node, wallet_server)], _ = simulator_and_wallet
+    await wallet_server.start_client(
+        PeerInfo(self_hostname, full_nodes[0].full_node.server.get_port()),
+        None,
+    )
+    peer = wallet_node.server.get_connections(NodeType.FULL_NODE)[0]
+    wallet_state_manager = wallet_node.wallet_state_manager
+
+    parent_coin = Coin(bytes32.secret(), bytes32.secret(), uint64(1))
+    await wallet_state_manager.coin_store.add_coin_record(
+        WalletCoinRecord(
+            parent_coin,
+            uint32(1),
+            uint32(0),
+            False,
+            False,
+            WalletType.STANDARD_WALLET,
+            1,
+        )
+    )
+    launcher_coin = Coin(parent_coin.name(), SINGLETON_LAUNCHER_PUZZLE_HASH, uint64(1))
+    launcher_state = CoinState(launcher_coin, uint32(2), uint32(2))
+    second_launcher_coin = Coin(parent_coin.name(), SINGLETON_LAUNCHER_PUZZLE_HASH, uint64(2))
+    second_launcher_state = CoinState(second_launcher_coin, uint32(2), uint32(2))
+    launcher_spend = make_spend(launcher_coin, Program.to(1), Program.to(1))
+    inner_puzzle_hash = bytes32.secret()
+
+    mocker.patch.object(wallet_node, "fetch_children", return_value=[launcher_state, second_launcher_state])
+    mocker.patch.object(wsm_mod, "fetch_coin_spend_for_coin_state", return_value=launcher_spend)
+    mocker.patch.object(wsm_mod, "solution_to_pool_state", side_effect=ValueError)
+    mocker.patch.object(DataLayerWallet, "match_dl_launcher", return_value=(True, inner_puzzle_hash))
+    mocker.patch.object(wallet_state_manager.puzzle_store, "puzzle_hash_exists", return_value=True)
+    track_new_launcher_id = mocker.patch.object(DataLayerWallet, "track_new_launcher_id")
+
+    coin_states = [CoinState(parent_coin, uint32(2), uint32(1))]
+
+    with anyio.fail_after(adjusted_timeout(10)):
+        async with assert_sync_mode(wallet_state_manager, uint32(2)):
+            assert await wallet_state_manager.add_coin_states(coin_states, peer, None)
+
+    assert len(await wallet_state_manager.get_all_wallet_info_entries(wallet_type=WalletType.DATA_LAYER)) == 1
+    track_new_launcher_id.assert_any_await(
+        launcher_coin.name(),
+        peer,
+        spend=launcher_spend,
+        height=uint32(2),
+    )
+    track_new_launcher_id.assert_any_await(
+        second_launcher_coin.name(),
+        peer,
+        spend=launcher_spend,
+        height=uint32(2),
+    )
+    assert track_new_launcher_id.await_count == 2
+
+
+@pytest.mark.parametrize("hardened", [True, False])
+@pytest.mark.limit_consensus_modes(allowed=[ConsensusMode.HARD_FORK_2_0])
+@pytest.mark.anyio
+async def test_get_private_key(simulator_and_wallet: OldSimulatorsAndWallets, hardened: bool) -> None:
+    _, [(wallet_node, _)], _ = simulator_and_wallet
+    wallet_state_manager: WalletStateManager = wallet_node.wallet_state_manager
+    derivation_index = uint32(10000)
+    conversion_method = master_sk_to_wallet_sk if hardened else master_sk_to_wallet_sk_unhardened
+    expected_private_key = conversion_method(wallet_state_manager.get_master_private_key(), derivation_index)
+    record = DerivationRecord(
+        derivation_index,
+        bytes32(b"0" * 32),
+        expected_private_key.get_g1(),
+        WalletType.STANDARD_WALLET,
+        uint32(1),
+        hardened,
+    )
+    await wallet_state_manager.puzzle_store.add_derivation_paths([record])
+    assert await wallet_state_manager.get_private_key(record.puzzle_hash) == expected_private_key
+
+
+@pytest.mark.limit_consensus_modes(allowed=[ConsensusMode.HARD_FORK_2_0])
+@pytest.mark.anyio
+async def test_get_private_key_failure(simulator_and_wallet: OldSimulatorsAndWallets) -> None:
+    _, [(wallet_node, _)], _ = simulator_and_wallet
+    wallet_state_manager: WalletStateManager = wallet_node.wallet_state_manager
+    invalid_puzzle_hash = bytes32(b"1" * 32)
+    with pytest.raises(ValueError, match=f"No key for puzzle hash: {invalid_puzzle_hash.hex()}"):
+        await wallet_state_manager.get_private_key(bytes32(b"1" * 32))
+
+
+@pytest.mark.limit_consensus_modes(allowed=[ConsensusMode.HARD_FORK_2_0])
+@pytest.mark.anyio
+async def test_determine_coin_type(simulator_and_wallet: OldSimulatorsAndWallets, self_hostname: str) -> None:
+    full_nodes, wallets, _ = simulator_and_wallet
+    full_node_api = full_nodes[0]
+    full_node_server = full_node_api.full_node.server
+    wallet_node, wallet_server = wallets[0]
+    await wallet_server.start_client(PeerInfo(self_hostname, full_node_server.get_port()), None)
+    wallet_state_manager: WalletStateManager = wallet_node.wallet_state_manager
+    peer = wallet_node.server.get_connections(NodeType.FULL_NODE)[0]
+    assert (None, None) == await wallet_state_manager.determine_coin_type(
+        peer, CoinState(Coin(bytes32(b"1" * 32), bytes32(b"1" * 32), uint64(0)), uint32(0), uint32(0)), None
+    )
+
+
+@pytest.mark.parametrize(
+    "wallet_environments",
+    [{"num_environments": 1, "blocks_needed": [1], "trusted": True, "reuse_puzhash": True}],
+    indirect=True,
+)
+@pytest.mark.limit_consensus_modes(reason="irrelevant")
+@pytest.mark.anyio
+async def test_commit_transactions_to_db(wallet_environments: WalletTestFramework) -> None:
+    env = wallet_environments.environments[0]
+    wsm = env.wallet_state_manager
+
+    async with wsm.new_action_scope(
+        wallet_environments.tx_config,
+        push=False,
+        merge_spends=False,
+        sign=False,
+        extra_spends=[],
+    ) as action_scope:
+        coins = list(await wsm.main_wallet.select_coins(uint64(2_000_000_000_000), action_scope))
+        await wsm.main_wallet.generate_signed_transaction(
+            [uint64(0)],
+            [bytes32.zeros],
+            action_scope,
+            coins={coins[0]},
+        )
+        await wsm.main_wallet.generate_signed_transaction(
+            [uint64(0)],
+            [bytes32.zeros],
+            action_scope,
+            coins={coins[1]},
+        )
+
+    created_txs = action_scope.side_effects.transactions
+
+    def flatten_spend_bundles(txs: list[TransactionRecord]) -> list[WalletSpendBundle]:
+        return [tx.spend_bundle for tx in txs if tx.spend_bundle is not None]
+
+    assert (
+        len(await wsm.tx_store.get_all_transactions_for_wallet(wsm.main_wallet.id(), type=TransactionType.OUTGOING_TX))
+        == 0
+    )
+
+    bundles = flatten_spend_bundles(created_txs)
+    assert len(bundles) == 2
+    for bundle in bundles:
+        assert bundle.aggregated_signature == G2Element()
+    assert (
+        len(await wsm.tx_store.get_all_transactions_for_wallet(wsm.main_wallet.id(), type=TransactionType.OUTGOING_TX))
+        == 0
+    )
+
+    extra_coin_spend = make_spend(
+        Coin(bytes32(b"1" * 32), bytes32(b"1" * 32), uint64(0)), Program.to(1), Program.to([])
+    )
+    extra_spend = WalletSpendBundle([extra_coin_spend], G2Element())
+
+    new_txs = await wsm.add_pending_transactions(
+        created_txs,
+        push=False,
+        merge_spends=False,
+        sign=False,
+        extra_spends=[extra_spend],
+    )
+    bundles = flatten_spend_bundles(new_txs)
+    assert len(bundles) == 2
+    for bundle in bundles:
+        assert bundle.aggregated_signature == G2Element()
+    assert (
+        len(await wsm.tx_store.get_all_transactions_for_wallet(wsm.main_wallet.id(), type=TransactionType.OUTGOING_TX))
+        == 0
+    )
+    assert extra_coin_spend in [spend for bundle in bundles for spend in bundle.coin_spends]
+
+    new_txs = await wsm.add_pending_transactions(
+        created_txs,
+        push=False,
+        merge_spends=True,
+        sign=False,
+        extra_spends=[extra_spend],
+    )
+    bundles = flatten_spend_bundles(new_txs)
+    assert len(bundles) == 1
+    for bundle in bundles:
+        assert bundle.aggregated_signature == G2Element()
+    assert (
+        len(await wsm.tx_store.get_all_transactions_for_wallet(wsm.main_wallet.id(), type=TransactionType.OUTGOING_TX))
+        == 0
+    )
+    assert extra_coin_spend in [spend for bundle in bundles for spend in bundle.coin_spends]
+
+    new_txs = await wsm.add_pending_transactions(created_txs, push=True, merge_spends=True, sign=True)
+    bundles = flatten_spend_bundles(new_txs)
+    assert len(bundles) == 1
+    assert (
+        len(await wsm.tx_store.get_all_transactions_for_wallet(wsm.main_wallet.id(), type=TransactionType.OUTGOING_TX))
+        == 2
+    )
+
+    await wallet_environments.full_node.wait_transaction_records_entered_mempool(new_txs)
+    await wallet_environments.full_node.farm_blocks_to_puzzlehash(count=1, guarantee_transaction_blocks=True)
+    await wallet_environments.full_node.wait_for_wallet_synced(wallet_node=env.node, timeout=20)
+
+    rpc_client = env.rpc_client
+
+    spendable_response = await rpc_client.get_spendable_coins(GetSpendableCoins(wallet_id=uint32(1)))
+    assert len(spendable_response.confirmed_records) > 0
+
+    select_response = await rpc_client.select_coins(SelectCoins(wallet_id=uint32(1), amount=uint64(1)))
+    assert len(select_response.coins) > 0
+
+    spendable = list(await wsm.get_spendable_coins_for_wallet(uint32(1)))
+    assert len(spendable) > 0
+    coin_name = spendable[0].coin.name()
+    records_response = await rpc_client.get_coin_records_by_names(GetCoinRecordsByNames(names=[coin_name]))
+    assert len(records_response.coin_records) == 1
+    assert records_response.coin_records[0].name == coin_name
+
+    height_response = GetHeightInfoResponse.from_json_dict(
+        await rpc_client.fetch("get_height_info", GetHeightInfo().to_json_dict())
+    )
+    assert height_response.height > 0
+    height_peak_response = GetHeightInfoResponse.from_json_dict(
+        await rpc_client.fetch("get_height_info", GetHeightInfo(use_peak_height=True).to_json_dict())
+    )
+    assert height_peak_response.height >= height_response.height
+
+
+@pytest.mark.parametrize(
+    "wallet_environments",
+    [{"num_environments": 2, "blocks_needed": [1, 1], "trusted": True, "reuse_puzhash": True}],
+    indirect=True,
+)
+@pytest.mark.limit_consensus_modes(reason="irrelevant")
+@pytest.mark.anyio
+async def test_confirming_txs_not_ours(wallet_environments: WalletTestFramework) -> None:
+    env_1 = wallet_environments.environments[0]
+    env_2 = wallet_environments.environments[1]
+
+    # Some transaction, doesn't matter what
+    async with env_1.wallet_state_manager.new_action_scope(wallet_environments.tx_config, push=False) as action_scope:
+        await env_1.xch_wallet.generate_signed_transaction(
+            [uint64(1)],
+            [await action_scope.get_puzzle_hash(env_1.wallet_state_manager)],
+            action_scope,
+        )
+
+    await env_2.rpc_client.push_transactions(
+        PushTransactions(
+            transactions=action_scope.side_effects.transactions,
+            sign=False,
+        ),
+        wallet_environments.tx_config,
+    )
+
+    await wallet_environments.process_pending_states(
+        [
+            WalletStateTransition(
+                pre_block_balance_updates={},
+                post_block_balance_updates={
+                    1: {
+                        "unspent_coin_count": 1,  # We just split a coin so no other balance changes
+                    }
+                },
+            ),
+            WalletStateTransition(
+                pre_block_balance_updates={
+                    1: {
+                        "pending_coin_removal_count": 1,  # not sure if this is desirable
+                    }
+                },
+                post_block_balance_updates={
+                    1: {
+                        "pending_coin_removal_count": -1,
+                    }
+                },
+            ),
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    "wallet_environments",
+    [{"num_environments": 2, "blocks_needed": [1, 1], "trusted": True, "reuse_puzhash": True}],
+    indirect=True,
+)
+@pytest.mark.limit_consensus_modes(reason="irrelevant")
+@pytest.mark.anyio
+async def test_confirming_txs_not_ours_with_remote_interest_coin(wallet_environments: WalletTestFramework) -> None:
+    """When a REMOTE-only coin record receives a spent update,
+    the spent status must be persisted without relying on network calls that
+    could fail and roll back the DB transaction.
+
+    Two environments are required because the REMOTE interest-only code path
+    in ``_add_coin_states`` is only reachable when ``get_wallet_identifier_for_puzzle_hash``
+    returns ``None`` — i.e. the coin's puzzle hash doesn't belong to any wallet
+    in this WSM's puzzle store.  If we used a single environment, the standard
+    wallet would already claim the puzzle hash, ``wallet_identifier`` would be
+    non-None, and the local-record REMOTE fallback (+ subsequent spent short-circuit)
+    would never execute.
+
+    env_1 owns the coins and builds the transaction; env_2 only has REMOTE
+    interest in the removal coin, guaranteeing the REMOTE path is taken when the
+    spent update arrives.
+    """
+    env_1 = wallet_environments.environments[0]
+    env_2 = wallet_environments.environments[1]
+
+    # env_1 builds but does NOT push the tx; env_2 will push it later.
+    async with env_1.wallet_state_manager.new_action_scope(wallet_environments.tx_config, push=False) as action_scope:
+        await env_1.xch_wallet.generate_signed_transaction(
+            [uint64(1)],
+            [await action_scope.get_puzzle_hash(env_1.wallet_state_manager)],
+            action_scope,
+        )
+
+    [tx] = action_scope.side_effects.transactions
+    [removed_coin] = tx.removals
+
+    # Register interest in the removal coin to force the REMOTE interest-only branch.
+    # Creating via RPC also covers the create_new_wallet endpoint for REMOTE_WALLET.
+    response = await env_2.rpc_client.create_new_wallet(
+        CreateNewWallet(wallet_type=CreateNewWalletType.REMOTE_WALLET, name="Remote Wallet #1", push=True),
+        tx_config=wallet_environments.tx_config,
+    )
+    assert response.type == WalletType.REMOTE.name
+    remote_wallet = env_2.wallet_state_manager.wallets[response.wallet_id]
+    assert isinstance(remote_wallet, RemoteWallet)
+    removed_coin_id = removed_coin.name()
+    await remote_wallet.register_remote_coins([removed_coin_id])
+
+    async def remote_record_spent_flag() -> int:
+        record = await env_2.wallet_state_manager.coin_store.get_coin_record(removed_coin_id)
+        if record is None:
+            return 0
+        return int(record.spent)
+
+    # The REMOTE interest record should exist and initially be unspent as coin is not yet spent.
+    await time_out_assert(20, remote_record_spent_flag, 0)
+
+    await env_2.rpc_client.push_transactions(
+        PushTransactions(
+            transactions=action_scope.side_effects.transactions,
+            sign=False,
+        ),
+        wallet_environments.tx_config,
+    )
+
+    async def pending_removal_count() -> int:
+        balance = (await env_2.rpc_client.get_wallet_balance(GetWalletBalance(wallet_id=uint32(1)))).wallet_balance
+        return int(balance.pending_coin_removal_count)
+
+    await time_out_assert(20, pending_removal_count, 1)
+
+    await wallet_environments.full_node.farm_blocks_to_puzzlehash(count=1, guarantee_transaction_blocks=True)
+    await wallet_environments.full_node.wait_for_wallet_synced(wallet_node=env_2.node, timeout=20)
+
+    await time_out_assert(20, pending_removal_count, 0)
+    # Regression check: spent updates for existing REMOTE records must not be skipped.
+    await time_out_assert(20, remote_record_spent_flag, 1)
+
+
+@dataclass
+class PuzzleHashState:
+    highest_index: int
+    used_up_to_index: int
+
+
+@pytest.mark.parametrize(
+    "wallet_environments",
+    [{"num_environments": 1, "blocks_needed": [1], "trusted": True, "reuse_puzhash": True}],
+    indirect=True,
+)
+@pytest.mark.limit_consensus_modes(reason="irrelevant")
+@pytest.mark.anyio
+async def test_puzzle_hash_requests(
+    wallet_environments: WalletTestFramework, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env = wallet_environments.environments[0]
+    wsm = env.wallet_state_manager
+
+    async def get_puzzle_hash_state() -> PuzzleHashState:
+        last_index = await wsm.puzzle_store.get_last_derivation_path_for_wallet(wsm.main_wallet.id())
+        assert last_index is not None
+        return PuzzleHashState(
+            last_index,
+            int((await wsm.puzzle_store.get_used_count(wsm.main_wallet.id())) / 2) - 1,  # hardened + unhardened
+        )
+
+    expected_state = await get_puzzle_hash_state()
+
+    # Quick test of this command
+    capsys.readouterr()
+    await GetDerivationIndexCMD(rpc_info=wallet_environments.cmd_tx_endpoint_args(env)["rpc_info"]).run()
+    assert f"Last derivation index: {expected_state.highest_index}" in capsys.readouterr().out
+
+    # `create_more_puzzle_hashes`
+    # No-op
+    result = await wsm.create_more_puzzle_hashes()
+    await result.commit(wsm)
+    assert await get_puzzle_hash_state() == expected_state
+
+    # Ensure the window continues to expand
+    await wsm.puzzle_store.set_used_up_to(uint32(expected_state.used_up_to_index + 1))
+    result = await wsm.create_more_puzzle_hashes()
+    await result.commit(wsm)
+    expected_state = PuzzleHashState(expected_state.highest_index + 1, expected_state.used_up_to_index + 1)
+    assert await get_puzzle_hash_state() == expected_state
+
+    # Explicitly make 1 extra
+    result = await wsm.create_more_puzzle_hashes(num_additional_phs=wsm.initial_num_public_keys + 1)
+    await result.commit(wsm)
+    expected_state = PuzzleHashState(expected_state.highest_index + 1, expected_state.used_up_to_index)
+    assert await get_puzzle_hash_state() == expected_state
+
+    # Make sure window doesn't expand on next use
+    await wsm.puzzle_store.set_used_up_to(uint32(expected_state.used_up_to_index + 1))
+    result = await wsm.create_more_puzzle_hashes()
+    await result.commit(wsm)
+    expected_state = PuzzleHashState(expected_state.highest_index, expected_state.used_up_to_index + 1)
+    assert await get_puzzle_hash_state() == expected_state
+
+    # Make sure `up_to_index` works
+    result = await wsm.create_more_puzzle_hashes(
+        up_to_index=uint32(expected_state.highest_index + 100), mark_existing_as_used=False
+    )
+    await result.commit(wsm)
+    expected_state = PuzzleHashState(
+        expected_state.highest_index + 100 + wsm.initial_num_public_keys, expected_state.used_up_to_index
+    )
+    assert await get_puzzle_hash_state() == expected_state
+
+    # Make sure `mark_existing_as_used` works
+    result = await wsm.create_more_puzzle_hashes(
+        up_to_index=uint32(expected_state.highest_index + 1), mark_existing_as_used=True
+    )
+    await result.commit(wsm)
+    expected_state = PuzzleHashState(
+        expected_state.highest_index + 1 + wsm.initial_num_public_keys, expected_state.highest_index
+    )
+    assert await get_puzzle_hash_state() == expected_state
+
+    # Test basic transactionality
+    result = await wsm.create_more_puzzle_hashes(
+        up_to_index=uint32(expected_state.highest_index + 1), mark_existing_as_used=False
+    )
+    result = await wsm.create_more_puzzle_hashes(
+        num_additional_phs=(expected_state.highest_index - expected_state.used_up_to_index)
+        + wsm.initial_num_public_keys
+        + 1,
+        mark_existing_as_used=False,
+        previous_result=result,
+    )
+    await result.commit(wsm)
+    expected_state = PuzzleHashState(
+        expected_state.highest_index + 1 + wsm.initial_num_public_keys + 1, expected_state.used_up_to_index
+    )
+    assert await get_puzzle_hash_state() == expected_state
+
+    # Test error using two different "config"s
+    result = await wsm.create_more_puzzle_hashes(mark_existing_as_used=False)
+    with pytest.raises(ValueError, match="different configuration"):
+        await wsm.create_more_puzzle_hashes(mark_existing_as_used=True, previous_result=result)
+
+    # Test generation with no local data
+    await wsm.puzzle_store.delete_wallet(wsm.main_wallet.id())
+    result = await wsm.create_more_puzzle_hashes()
+    await result.commit(wsm)
+    expected_state = PuzzleHashState(
+        wsm.initial_num_public_keys, -1
+    )  # -1 being no puzzle hashes used, not even at index 0
+    assert await get_puzzle_hash_state() == expected_state
+
+    # Test `from_zero` fills in gaps
+    async with wsm.puzzle_store.db_wrapper.writer() as conn:
+        await conn.execute(
+            "DELETE FROM derivation_paths WHERE derivation_index=?",
+            (0,),
+        )
+    assert await get_puzzle_hash_state() == expected_state
+    assert (
+        len(list(await wsm.puzzle_store.get_all_puzzle_hashes())) == (expected_state.highest_index) * 2
+    )  # 0 inclusive
+    result = await wsm.create_more_puzzle_hashes(
+        from_zero=True, mark_existing_as_used=False, up_to_index=uint32(expected_state.highest_index)
+    )
+    await result.commit(wsm)
+    expected_state = PuzzleHashState(expected_state.highest_index + wsm.initial_num_public_keys, -1)
+    assert await get_puzzle_hash_state() == expected_state
+    assert len(list(await wsm.puzzle_store.get_all_puzzle_hashes())) == (expected_state.highest_index + 1) * 2
+
+    # `get_unused_derivation_record`
+    # Assert index increases
+    assert expected_state.highest_index > expected_state.used_up_to_index
+    await wsm.get_unused_derivation_record(wsm.main_wallet.id())
+    expected_state = PuzzleHashState(expected_state.highest_index, expected_state.used_up_to_index + 1)
+    assert await get_puzzle_hash_state() == expected_state
+
+    # Assert more puzzle hashes get made
+    await wsm.puzzle_store.set_used_up_to(uint32(expected_state.highest_index))
+    await wsm.get_unused_derivation_record(wsm.main_wallet.id())
+    expected_state = PuzzleHashState(
+        expected_state.highest_index + wsm.initial_num_public_keys + 1, expected_state.highest_index + 1
+    )
+    assert await get_puzzle_hash_state() == expected_state
+
+    # Test transactionality
+    previous_result = None
+    for _ in range(wsm.initial_num_public_keys):  # all currently unused
+        previous_result = await wsm._get_unused_derivation_record(wsm.main_wallet.id(), previous_result=previous_result)
+    assert previous_result is not None
+    await previous_result.commit(wsm)
+    expected_state = PuzzleHashState(
+        expected_state.highest_index + wsm.initial_num_public_keys, expected_state.highest_index
+    )
+    assert await get_puzzle_hash_state() == expected_state
+
+    # `extend_derivation_index`
+    # Check malformed request
+    rpc_client = wallet_environments.environments[0].rpc_client
+    with pytest.raises(ValueError):
+        await rpc_client.fetch("extend_derivation_index", {})
+
+    # Test no existing derivation paths
+    async with wsm.puzzle_store.db_wrapper.writer() as conn:
+        await conn.execute(
+            "DELETE FROM derivation_paths WHERE derivation_index=?",
+            (0,),
+        )
+    with pytest.raises(ValueError):
+        await rpc_client.extend_derivation_index(ExtendDerivationIndex(index=uint32(0)))
+
+    # Reset to a normal state
+    await wsm.puzzle_store.delete_wallet(wsm.main_wallet.id())
+    result = await wsm.create_more_puzzle_hashes()
+    await result.commit(wsm)
+    expected_state = PuzzleHashState(wsm.initial_num_public_keys, -1)
+    assert await get_puzzle_hash_state() == expected_state
+
+    # Test an index already created
+    with pytest.raises(ValueError):
+        await rpc_client.extend_derivation_index(ExtendDerivationIndex(index=uint32(0)))
+
+    # Test an index too far in the future
+    with pytest.raises(ValueError):
+        await rpc_client.extend_derivation_index(
+            ExtendDerivationIndex(index=uint32(MAX_DERIVATION_INDEX_DELTA + expected_state.highest_index + 1))
+        )
+
+    # Test the actual functionality
+    capsys.readouterr()
+    await UpdateDerivationIndexCMD(
+        rpc_info=wallet_environments.cmd_tx_endpoint_args(env)["rpc_info"],
+        index=expected_state.highest_index + 5,
+    ).run()
+    assert f"Updated derivation index: {expected_state.highest_index + 5}" in capsys.readouterr().out
+    expected_state = PuzzleHashState(expected_state.highest_index + 5, expected_state.used_up_to_index)
+    assert await get_puzzle_hash_state() == expected_state
+
+
+@pytest.mark.limit_consensus_modes(allowed=[ConsensusMode.HARD_FORK_2_0])
+@pytest.mark.anyio
+async def test_get_sync_status(simulator_and_wallet: OldSimulatorsAndWallets, self_hostname: str) -> None:
+    full_nodes, wallets, _ = simulator_and_wallet
+    full_node_api = full_nodes[0]
+    full_node_server = full_node_api.full_node.server
+    wallet_node, wallet_server = wallets[0]
+    await wallet_server.start_client(PeerInfo(self_hostname, full_node_server.get_port()), None)
+    wsm: WalletStateManager = wallet_node.wallet_state_manager
+
+    # Farm enough blocks so peak height > 10 (needed for LONG_SYNC test)
+    await full_node_api.farm_blocks_to_puzzlehash(count=12, guarantee_transaction_blocks=True)
+    await full_node_api.wait_for_wallet_synced(wallet_node=wallet_node, timeout=20)
+
+    original_network = wsm.config["selected_network"]
+
+    # SYNCED via simulator shortcut (line 742)
+    wsm.config["selected_network"] = "simulator0"
+    try:
+        assert await wsm.get_sync_status() == SyncStatus.SYNCED
+    finally:
+        wsm.config["selected_network"] = original_network
+
+    # SYNCED via normal path (line 754) — wallet is fully synced
+    assert await wsm.get_sync_status() == SyncStatus.SYNCED
+
+    # SLIGHTLY_BEHIND (line 752) — height gap small but synced() returns False
+    peak = wsm.blockchain._peak
+    assert peak is not None
+    assert peak.height > 10, f"Need peak > 10 for sync tests, got {peak.height}"
+    original_network = wsm.config["selected_network"]
+    wsm.config["selected_network"] = "mainnet"
+    try:
+        await wsm.blockchain.set_finished_sync_up_to(peak.height - 5, in_rollback=True)
+        status = await wsm.get_sync_status()
+        assert status == SyncStatus.SLIGHTLY_BEHIND, f"Expected SLIGHTLY_BEHIND, got {status}"
+    finally:
+        wsm.config["selected_network"] = original_network
+
+    # LONG_SYNC (line 749) — set finished_sync_up_to far behind peak
+    await wsm.blockchain.set_finished_sync_up_to(0, in_rollback=True)
+    assert await wsm.get_sync_status() == SyncStatus.LONG_SYNC
+
+    # DISCONNECTED (line 745) — disconnect from peer
+    await wallet_server.close_all_connections()
+    await time_out_assert(5, lambda: len(wsm.wallet_node.server.get_connections(NodeType.FULL_NODE)), 0)
+    assert await wsm.get_sync_status() == SyncStatus.DISCONNECTED
+
+
+@pytest.mark.parametrize(
+    "wallet_environments",
+    [{"num_environments": 1, "blocks_needed": [1], "trusted": True, "reuse_puzhash": True}],
+    indirect=True,
+)
+@pytest.mark.limit_consensus_modes(reason="irrelevant")
+@pytest.mark.anyio
+async def test_rpc_get_puzzle_and_solution(wallet_environments: WalletTestFramework) -> None:
+    env = wallet_environments.environments[0]
+    rpc_client = env.rpc_client
+    wsm = env.wallet_state_manager
+    full_node = wallet_environments.full_node
+
+    async with wsm.new_action_scope(wallet_environments.tx_config, push=True) as action_scope:
+        await wsm.main_wallet.generate_signed_transaction(
+            [uint64(1)],
+            [bytes32.zeros],
+            action_scope,
+        )
+
+    [tx] = action_scope.side_effects.transactions
+    spent_coin = tx.removals[0]
+
+    await full_node.wait_transaction_records_entered_mempool([tx])
+    await full_node.farm_blocks_to_puzzlehash(count=1, guarantee_transaction_blocks=True)
+    await full_node.wait_for_wallet_synced(wallet_node=env.node, timeout=20)
+
+    request = GetPuzzleAndSolution(coin_name=spent_coin.name()).to_json_dict()
+    response = GetPuzzleAndSolutionResponse.from_json_dict(await rpc_client.fetch("get_puzzle_and_solution", request))
+    assert response.puzzle_reveal != ""
+    assert response.solution != ""
+
+    with pytest.raises(ValueError, match="not found or not spent"):
+        await rpc_client.fetch("get_puzzle_and_solution", GetPuzzleAndSolution(coin_name=bytes32.zeros).to_json_dict())
+
+
+@pytest.mark.parametrize(
+    "wallet_environments",
+    [{"num_environments": 1, "blocks_needed": [1], "trusted": True, "reuse_puzhash": True}],
+    indirect=True,
+)
+@pytest.mark.limit_consensus_modes(reason="irrelevant")
+@pytest.mark.anyio
+async def test_rpc_disconnected_errors(wallet_environments: WalletTestFramework) -> None:
+    """Verify that RPC endpoints raise when the wallet has no full node peers."""
+    env = wallet_environments.environments[0]
+    rpc_client = env.rpc_client
+    wsm = env.wallet_state_manager
+
+    # Build a dummy PushTransactions request while still connected
+    async with wsm.new_action_scope(wallet_environments.tx_config, push=False) as action_scope:
+        await wsm.main_wallet.generate_signed_transaction([uint64(1)], [bytes32.zeros], action_scope)
+    txs = action_scope.side_effects.transactions
+
+    # Disconnect from all full node peers
+    await env.peer_server.close_all_connections()
+    await time_out_assert(5, lambda: len(wsm.wallet_node.server.get_connections(NodeType.FULL_NODE)), 0)
+
+    # tx_endpoint decorator DISCONNECTED check (line 341)
+    with pytest.raises(ValueError, match="not connected"):
+        await rpc_client.push_transactions(
+            PushTransactions(transactions=txs, sign=False),
+            wallet_environments.tx_config,
+        )
+
+    # select_coins DISCONNECTED check
+    with pytest.raises(ValueError, match="not connected"):
+        await rpc_client.select_coins(SelectCoins(wallet_id=uint32(1), amount=uint64(1)))
+
+    # get_spendable_coins DISCONNECTED check
+    with pytest.raises(ValueError, match="not connected"):
+        await rpc_client.get_spendable_coins(GetSpendableCoins(wallet_id=uint32(1)))
+
+    # get_coin_records_by_names DISCONNECTED check
+    with pytest.raises(ValueError, match="not connected"):
+        await rpc_client.get_coin_records_by_names(GetCoinRecordsByNames(names=[bytes32.zeros]))
+
+    # Check the no-peers early exit.
+    original_network = wsm.config["selected_network"]
+    wsm.config["selected_network"] = "simulator0"
+    try:
+        with pytest.raises(ValueError, match="No full node peers connected"):
+            await rpc_client.get_coin_records_by_names(GetCoinRecordsByNames(names=[bytes32.zeros]))
+    finally:
+        wsm.config["selected_network"] = original_network
+
+
+@pytest.mark.parametrize(
+    "wallet_environments",
+    [{"num_environments": 1, "blocks_needed": [4], "trusted": False, "reuse_puzhash": True}],
+    indirect=True,
+)
+@pytest.mark.limit_consensus_modes(reason="irrelevant")
+@pytest.mark.anyio
+async def test_get_height_info_with_block_record(wallet_environments: WalletTestFramework) -> None:
+    """Ensure the block record branch is hit (untrusted sync populates block records)."""
+    env = wallet_environments.environments[0]
+    rpc_client = env.rpc_client
+    blockchain = env.wallet_state_manager.blockchain
+
+    synced_height = await blockchain.get_finished_sync_up_to()
+    assert blockchain.contains_height(synced_height)
+
+    response = GetHeightInfoResponse.from_json_dict(
+        await rpc_client.fetch("get_height_info", GetHeightInfo(use_peak_height=False).to_json_dict())
+    )
+    assert response.height == synced_height
+    assert response.is_transaction_block is not None
+
+
+async def _seed_did_scoped_nft_wallets(wsm: WalletStateManager, did_ids: list[bytes32]) -> list[NFTWallet]:
+    """Create one DID-scoped NFT wallet per ``did_ids`` via the real auto-create path."""
+    created: list[NFTWallet] = []
+    for index, did_id in enumerate(did_ids):
+        wallet = await NFTWallet.create_new_nft_wallet(wsm, wsm.main_wallet, did_id=did_id, name=f"NFT {index}")
+        created.append(wallet)
+    return created
+
+
+def _build_fake_nft_data(
+    *,
+    old_p2_puzhash: bytes32,
+    singleton_launcher_id: bytes32,
+) -> NFTCoinData:
+    """Build a duck-typed NFTCoinData for ``handle_nft``.
+
+    ``handle_nft`` only accesses a small subset of fields and the helpers it
+    invokes (``get_metadata_and_phs`` and ``get_new_owner_did``) are patched in
+    the tests. Constructing real on-chain CoinSpend/UncurriedNFT objects would
+    require a full NFT mint, which is orthogonal to the cap behavior under test.
+    """
+    uncurried_nft = SimpleNamespace(
+        supports_did=True,
+        owner_did=None,
+        p2_puzzle=SimpleNamespace(get_tree_hash=lambda: old_p2_puzhash),
+        singleton_launcher_id=singleton_launcher_id,
+    )
+    parent_coin_spend = SimpleNamespace(
+        solution=bytes(Program.to([])),
+        coin=SimpleNamespace(),
+    )
+    parent_coin_state = SimpleNamespace(spent_height=None)
+    return cast(
+        NFTCoinData,
+        SimpleNamespace(
+            uncurried_nft=uncurried_nft,
+            parent_coin_spend=parent_coin_spend,
+            parent_coin_state=parent_coin_state,
+        ),
+    )
+
+
+@pytest.mark.limit_consensus_modes(reason="cap logic is consensus-independent")
+@pytest.mark.parametrize(
+    "case, configured_limit, preexisting_did_ids, seed_matching_wallet, expect_new_wallet, expect_warning",
+    [
+        pytest.param(
+            "at_limit_blocks_creation",
+            2,
+            [bytes32(b"\x01" * 32), bytes32(b"\x02" * 32)],
+            False,
+            False,
+            True,
+            id="at_limit_blocks_creation",
+        ),
+        pytest.param(
+            "below_limit_creates_wallet",
+            2,
+            [bytes32(b"\x01" * 32)],
+            False,
+            True,
+            False,
+            id="below_limit_creates_wallet",
+        ),
+        pytest.param(
+            "matching_wallet_skips_cap",
+            1,
+            [bytes32(b"\x01" * 32)],
+            True,
+            False,
+            False,
+            id="matching_wallet_skips_cap",
+        ),
+        pytest.param(
+            "yaml_default_governs",
+            None,
+            [],
+            False,
+            True,
+            False,
+            id="yaml_default_governs",
+        ),
+    ],
+)
+@pytest.mark.anyio
+async def test_handle_nft_auto_add_limit(
+    simulator_and_wallet: OldSimulatorsAndWallets,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    case: str,
+    configured_limit: int | None,
+    preexisting_did_ids: list[bytes32],
+    seed_matching_wallet: bool,
+    expect_new_wallet: bool,
+    expect_warning: bool,
+) -> None:
+    """Regression test for the NFT auto-add cap.
+
+    The inner-puzzle-parsed ``new_did_id`` in NFT transfer data is
+    attacker-controllable. Without a cap, ``handle_nft`` would create one
+    NFT wallet per unique foreign DID with no upper bound (in contrast to
+    the existing ``did_auto_add_limit`` for DID ingestion). This test
+    pins down four behaviors:
+
+    - at the configured limit, ``handle_nft`` returns ``None`` and emits a
+      warning (no new wallet is created);
+    - below the limit, ``handle_nft`` creates a new wallet;
+    - when an existing NFT wallet already matches ``new_did_id``, the cap
+      is not consulted at all (a regression that hoisted the cap above
+      the matching loop would break inbound NFT routing for users at the
+      cap);
+    - when ``nft_auto_add_limit`` is not present in the config, the
+      ``initial-config.yaml`` default of 100 governs — this catches both
+      a wrong default literal in the code and any drift between the YAML
+      key name and the code's ``config.get`` key.
+    """
+    _, [(wallet_node, _)], _ = simulator_and_wallet
+    wsm = wallet_node.wallet_state_manager
+
+    if configured_limit is not None:
+        wsm.config["nft_auto_add_limit"] = configured_limit
+    else:
+        # The YAML-loaded default must reach the wsm.config dict under the exact
+        # key the handle_nft cap reads. Catches both a wrong default literal in
+        # initial-config.yaml and any drift between the YAML key and the
+        # `config.get("nft_auto_add_limit", ...)` call site in handle_nft.
+        assert wsm.config.get("nft_auto_add_limit") == 100
+
+    new_p2_puzhash = bytes32(b"\xaa" * 32)
+    old_p2_puzhash = bytes32(b"\xbb" * 32)
+    singleton_launcher_id = bytes32(b"\xcc" * 32)
+    foreign_did_id = bytes32(b"\xff" * 32)
+
+    sk = master_sk_to_wallet_sk_unhardened(wsm.get_master_private_key(), uint32(99999))
+    await wsm.puzzle_store.add_derivation_paths(
+        [
+            DerivationRecord(
+                uint32(99999),
+                new_p2_puzhash,
+                sk.get_g1(),
+                WalletType.STANDARD_WALLET,
+                uint32(1),
+                False,
+            )
+        ]
+    )
+
+    await _seed_did_scoped_nft_wallets(wsm, preexisting_did_ids)
+    if seed_matching_wallet:
+        await _seed_did_scoped_nft_wallets(wsm, [foreign_did_id])
+
+    def fake_get_metadata_and_phs(_unft: UncurriedNFT, _solution: bytes) -> tuple[Program, bytes32]:
+        return Program.to(0), new_p2_puzhash
+
+    def fake_get_new_owner_did(_unft: UncurriedNFT, _solution: Program) -> bytes32:
+        return foreign_did_id
+
+    monkeypatch.setattr(nft_wallet_mod, "get_metadata_and_phs", fake_get_metadata_and_phs)
+    monkeypatch.setattr(nft_wallet_mod, "get_new_owner_did", fake_get_new_owner_did)
+
+    nft_data = _build_fake_nft_data(
+        old_p2_puzhash=old_p2_puzhash,
+        singleton_launcher_id=singleton_launcher_id,
+    )
+
+    def nft_wallet_count() -> int:
+        return sum(1 for w in wsm.wallets.values() if isinstance(w, NFTWallet))
+
+    before = nft_wallet_count()
+    with caplog.at_level(logging.WARNING, logger=wsm.log.name):
+        result = await NFTWallet.identify(wsm, nft_data)
+    after = nft_wallet_count()
+
+    if seed_matching_wallet:
+        assert result is not None
+        existing_wallet = wsm.wallets[result.id]
+        assert isinstance(existing_wallet, NFTWallet)
+        assert existing_wallet.nft_wallet_info.did_id == foreign_did_id
+        assert after == before
+    elif expect_new_wallet:
+        assert result is not None
+        assert after == before + 1
+        new_wallet = wsm.wallets[result.id]
+        assert isinstance(new_wallet, NFTWallet)
+        assert new_wallet.nft_wallet_info.did_id == foreign_did_id
+    else:
+        assert result is None
+        assert after == before
+        assert not any(
+            isinstance(w, NFTWallet) and w.nft_wallet_info.did_id == foreign_did_id for w in wsm.wallets.values()
+        )
+
+    if expect_warning:
+        assert any("nft" in rec.message.lower() and "limit" in rec.message.lower() for rec in caplog.records), (
+            f"Expected a cap warning to be emitted; got: {[rec.message for rec in caplog.records]}"
+        )
+    else:
+        assert not any("limit" in rec.message.lower() for rec in caplog.records)

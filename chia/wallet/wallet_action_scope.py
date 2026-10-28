@@ -1,0 +1,198 @@
+from __future__ import annotations
+
+import contextlib
+from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, cast, final
+
+from chia_rs.chia_rs import G1Element
+from chia_rs.sized_bytes import bytes32
+from chia_rs.sized_ints import uint32, uint64
+
+from chia.data_layer.singleton_record import SingletonRecord
+from chia.pools.plotnft_drivers import PoolConfig
+from chia.types.blockchain_format.coin import Coin
+from chia.types.blockchain_format.program import Program
+from chia.util.action_scope import ActionScope
+from chia.util.streamable import Streamable, streamable
+from chia.wallet.derivation_record import DerivationRecord
+from chia.wallet.signer_protocol import SigningResponse
+from chia.wallet.transaction_record import TransactionRecord
+from chia.wallet.util.tx_config import TXConfig
+from chia.wallet.wallet_spend_bundle import WalletSpendBundle
+from chia.wallet.wsm_apis import GetUnusedDerivationRecordResult
+
+if TYPE_CHECKING:
+    # Avoid a circular import here
+    from chia.wallet.wallet_state_manager import WalletStateManager
+
+
+@streamable
+@dataclass(kw_only=True, frozen=True)
+class PlotNFTTargetStateInfo(Streamable):
+    wallet_id: uint32
+    exiting_fee: uint64
+    next_pool_url: str | None
+    next_pool_puzzle_hash: bytes32 | None
+    next_heightlock: uint32 | None
+    next_pool_memoization: Program | None
+
+    def __post_init__(self) -> None:
+        if (self.next_pool_url, self.next_pool_puzzle_hash, self.next_heightlock, self.next_pool_memoization) != (
+            None,
+            None,
+            None,
+            None,
+        ) and (
+            None
+            in {
+                self.next_pool_url,
+                self.next_pool_puzzle_hash,
+                self.next_heightlock,
+            }
+            or self.next_pool_memoization is None
+        ):
+            raise ValueError("Error initializing next PlotNFT target state, not all options for join were specified")
+        super().__post_init__()
+
+    @property
+    def pool_url_and_config(self) -> tuple[str, PoolConfig] | None:
+        if (
+            self.next_pool_url is None
+            or self.next_pool_puzzle_hash is None
+            or self.next_heightlock is None
+            or self.next_pool_memoization is None
+        ):
+            return None
+        return self.next_pool_url, PoolConfig(
+            pool_puzzle_hash=self.next_pool_puzzle_hash,
+            heightlock=self.next_heightlock,
+            pool_memoization=self.next_pool_memoization,
+        )
+
+
+@dataclass
+class WalletSideEffects:
+    transactions: list[TransactionRecord] = field(default_factory=list)
+    signing_responses: list[SigningResponse] = field(default_factory=list)
+    extra_spends: list[WalletSpendBundle] = field(default_factory=list)
+    selected_coins: list[Coin] = field(default_factory=list)
+    singleton_records: list[SingletonRecord] = field(default_factory=list)
+    plotnft_exiting_info: PlotNFTTargetStateInfo | None = None
+    get_unused_derivation_record_result: GetUnusedDerivationRecordResult | None = None
+
+
+@final
+@dataclass(frozen=True)
+class WalletActionConfig:
+    push: bool
+    merge_spends: bool
+    sign: bool | None
+    additional_signing_responses: list[SigningResponse]
+    extra_spends: list[WalletSpendBundle]
+    tx_config: TXConfig
+    puzzle_for_pk: Callable[[G1Element], Program]
+
+    def adjust_for_side_effects(self, side_effects: WalletSideEffects) -> WalletActionConfig:
+        return replace(
+            self,
+            tx_config=replace(
+                self.tx_config,
+                excluded_coin_ids=[*self.tx_config.excluded_coin_ids, *(c.name() for c in side_effects.selected_coins)],
+            ),
+        )
+
+
+class WalletActionScope(ActionScope[WalletSideEffects, WalletActionConfig]):
+    async def _get_unused_derivation_path(
+        self, wallet_state_manager: WalletStateManager
+    ) -> GetUnusedDerivationRecordResult:
+        async with self.use() as interface:
+            result = await wallet_state_manager._get_unused_derivation_record(
+                wallet_state_manager.main_wallet.id(),
+                previous_result=interface.side_effects.get_unused_derivation_record_result
+                if interface.side_effects.get_unused_derivation_record_result is not None
+                else None,
+            )
+            interface.side_effects.get_unused_derivation_record_result = result
+        return result
+
+    async def _get_new_puzzle(self, wallet_state_manager: WalletStateManager) -> Program:
+        puzzle = self.config.puzzle_for_pk((await self._get_unused_derivation_path(wallet_state_manager)).record.pubkey)
+        return puzzle
+
+    async def _get_new_puzzle_hash(self, wallet_state_manager: WalletStateManager) -> bytes32:
+        return (await self._get_unused_derivation_path(wallet_state_manager)).record.puzzle_hash
+
+    async def get_puzzle(
+        self, wallet_state_manager: WalletStateManager, override_reuse_puzhash_with: bool | None = None
+    ) -> Program:
+        if (
+            self.config.tx_config.reuse_puzhash or override_reuse_puzhash_with is True
+        ) and override_reuse_puzhash_with is not False:
+            record: DerivationRecord | None = await wallet_state_manager.get_current_derivation_record_for_wallet(
+                wallet_state_manager.main_wallet.id()
+            )
+            if record is None:
+                return await self._get_new_puzzle(wallet_state_manager)  # pragma: no cover
+            puzzle = self.config.puzzle_for_pk(record.pubkey)
+            return puzzle
+        else:
+            return await self._get_new_puzzle(wallet_state_manager)
+
+    async def get_puzzle_hash(
+        self, wallet_state_manager: WalletStateManager, override_reuse_puzhash_with: bool | None = None
+    ) -> bytes32:
+        if (
+            self.config.tx_config.reuse_puzhash or override_reuse_puzhash_with is True
+        ) and override_reuse_puzhash_with is not False:
+            record: DerivationRecord | None = await wallet_state_manager.get_current_derivation_record_for_wallet(
+                wallet_state_manager.main_wallet.id()
+            )
+            if record is None:
+                return await self._get_new_puzzle_hash(wallet_state_manager)  # pragma: no cover
+            return record.puzzle_hash
+        else:
+            return await self._get_new_puzzle_hash(wallet_state_manager)
+
+
+@contextlib.asynccontextmanager
+async def new_wallet_action_scope(
+    wallet_state_manager: WalletStateManager,
+    tx_config: TXConfig,
+    push: bool = False,
+    merge_spends: bool = True,
+    sign: bool | None = None,
+    additional_signing_responses: list[SigningResponse] = [],
+    extra_spends: list[WalletSpendBundle] = [],
+    puzzle_for_pk: Callable[[G1Element], Program] | None = None,
+) -> AsyncIterator[WalletActionScope]:
+    if puzzle_for_pk is None:
+        puzzle_for_pk = wallet_state_manager.main_wallet.puzzle_for_pk
+    assert puzzle_for_pk is not None
+    async with WalletActionScope.new_scope(
+        WalletSideEffects(),
+        WalletActionConfig(
+            push, merge_spends, sign, additional_signing_responses, extra_spends, tx_config, puzzle_for_pk
+        ),
+    ) as self:
+        self = cast(WalletActionScope, self)
+        async with self.use() as interface:
+            interface.side_effects.signing_responses = additional_signing_responses.copy()
+            interface.side_effects.extra_spends = extra_spends.copy()
+
+        yield self
+
+    if self.side_effects.transactions != []:
+        self.side_effects.transactions = await wallet_state_manager.add_pending_transactions(
+            self.side_effects.transactions,
+            push=push,
+            merge_spends=merge_spends,
+            sign=sign,
+            additional_signing_responses=self.side_effects.signing_responses,
+            extra_spends=self.side_effects.extra_spends,
+            singleton_records=self.side_effects.singleton_records,
+            plotnft_exiting_info=self.side_effects.plotnft_exiting_info,
+        )
+    if push and self.side_effects.get_unused_derivation_record_result is not None:
+        await self.side_effects.get_unused_derivation_record_result.commit(wallet_state_manager)

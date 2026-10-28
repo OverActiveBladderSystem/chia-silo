@@ -1,0 +1,157 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Generic, TypeVar
+
+from chia_rs import SpendBundle
+from chia_rs.sized_bytes import bytes32
+from chia_rs.sized_ints import uint8, uint32, uint64
+
+from chia.consensus.coinbase import farmer_parent_id, pool_parent_id
+from chia.types.blockchain_format.coin import Coin
+from chia.types.mempool_inclusion_status import MempoolInclusionStatus
+from chia.util.bech32m import decode_puzzle_hash
+from chia.util.errors import Err
+from chia.util.streamable import Streamable, streamable
+from chia.wallet.conditions import ConditionValidTimes
+from chia.wallet.util.transaction_type import TransactionType
+from chia.wallet.wallet_spend_bundle import WalletSpendBundle
+
+T = TypeVar("T")
+
+minimum_send_attempts = 6
+
+
+@dataclass
+class ItemAndTransactionRecords(Generic[T]):
+    item: T
+    transaction_records: list[TransactionRecord]
+
+
+@streamable
+@dataclass(frozen=True, kw_only=True)
+class TransactionRecordOld(Streamable):
+    """
+    Used for storing transaction data and status in wallets.
+    """
+
+    confirmed_at_height: uint32
+    created_at_time: uint64
+    to_puzzle_hash: bytes32
+    amount: uint64
+    fee_amount: uint64
+    confirmed: bool
+    sent: uint32
+    spend_bundle: WalletSpendBundle | None
+    additions: list[Coin]
+    removals: list[Coin]
+    wallet_id: uint32
+
+    # Represents the list of peers that we sent the transaction to, whether each one
+    # included it in the mempool, and what the error message (if any) was
+    sent_to: list[tuple[str, uint8, str | None]]
+    trade_id: bytes32 | None
+    type: uint32  # TransactionType
+
+    # name is also called bundle_id and tx_id
+    name: bytes32
+    memos: dict[bytes32, list[bytes]]
+
+    def is_in_mempool(self) -> bool:
+        # If one of the nodes we sent it to responded with success or pending, we return True
+        for _, mis, _ in self.sent_to:
+            if mis in {MempoolInclusionStatus.SUCCESS.value, MempoolInclusionStatus.PENDING.value}:
+                return True
+        return False
+
+    def height_farmed(self, genesis_challenge: bytes32) -> uint32 | None:
+        if not self.confirmed:
+            return None
+        if self.type in {TransactionType.FEE_REWARD.value, TransactionType.COINBASE_REWARD.value}:
+            for block_index in range(self.confirmed_at_height, self.confirmed_at_height - 100, -1):
+                if block_index < 0:
+                    return None
+                pool_parent = pool_parent_id(uint32(block_index), genesis_challenge)
+                farmer_parent = farmer_parent_id(uint32(block_index), genesis_challenge)
+                if pool_parent == self.additions[0].parent_coin_info:
+                    return uint32(block_index)
+                if farmer_parent == self.additions[0].parent_coin_info:
+                    return uint32(block_index)
+        return None
+
+    def is_valid(self) -> bool:
+        if len(self.sent_to) < minimum_send_attempts:
+            # we haven't tried enough peers yet
+            return True
+        if any(x[1] == MempoolInclusionStatus.SUCCESS.value for x in self.sent_to):
+            # we managed to push it to mempool at least once
+            return True
+        if any(x[1] == MempoolInclusionStatus.PENDING.value for x in self.sent_to):
+            # The node kept the spend to try again. That is not a finished failure.
+            return True
+        if any(
+            x[2]
+            in {
+                Err.INVALID_FEE_LOW_FEE.name,
+                Err.INVALID_FEE_TOO_CLOSE_TO_ZERO.name,
+                Err.UNKNOWN_UNSPENT.name,
+            }
+            for x in self.sent_to
+        ):
+            # A low fee can pass later. A missing coin row is not proof the coin was spent.
+            return True
+        return False
+
+    def hint_dict(self) -> dict[bytes32, bytes32]:
+        return {
+            coin_id: bytes32(memos[0])
+            for coin_id, memos in self.memos.items()
+            if len(memos) > 0 and len(memos[0]) == 32
+        }
+
+
+@streamable
+@dataclass(frozen=True, kw_only=True)
+class TransactionRecord(TransactionRecordOld):
+    valid_times: ConditionValidTimes
+    to_address: str
+
+    def __post_init__(self) -> None:
+        if decode_puzzle_hash(self.to_address) != self.to_puzzle_hash:
+            raise ValueError("Invalid tx record initialization, to_address must match to_puzzle_hash")
+        return super().__post_init__()
+
+
+_RESTORED_AFTER_REORG = {
+    TransactionType.OUTGOING_TX,
+    TransactionType.OUTGOING_TRADE,
+    TransactionType.INCOMING_TRADE,
+    TransactionType.OUTGOING_CLAWBACK,
+    TransactionType.INCOMING_CLAWBACK_SEND,
+    TransactionType.INCOMING_CLAWBACK_RECEIVE,
+}
+
+
+def transaction_returns_after_reorg(record: TransactionRecord, *, coin_still_present: bool) -> bool:
+    """Whether a confirmed row deleted by a reorg should be put back as unconfirmed.
+
+    A note written when a coin was first seen already spent has no spend bundle.
+    Putting that back makes the restored coin look pending. A clawback incoming
+    row is only claimable while its coin is still in the wallet.
+    """
+    kind = TransactionType(record.type)
+    if kind in {TransactionType.INCOMING_CLAWBACK_SEND, TransactionType.INCOMING_CLAWBACK_RECEIVE}:
+        return coin_still_present
+    if kind is TransactionType.OUTGOING_TX and record.spend_bundle is None:
+        return False
+    return kind in _RESTORED_AFTER_REORG
+
+
+@streamable
+@dataclass(frozen=True)
+class LightTransactionRecord(Streamable):
+    name: bytes32
+    type: uint32
+    additions: list[Coin]
+    removals: list[Coin]
+    spend_bundle: SpendBundle | None

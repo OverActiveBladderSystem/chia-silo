@@ -1,0 +1,1021 @@
+from __future__ import annotations
+
+import dataclasses
+import logging
+import time
+import traceback
+from typing import TYPE_CHECKING, Any, ClassVar, cast
+
+from chia_rs import CoinSpend, CoinState, G1Element
+from chia_rs.sized_bytes import bytes32
+from chia_rs.sized_ints import uint32, uint64, uint128
+from typing_extensions import Self, Unpack
+
+from chia.consensus.default_constants import DEFAULT_CONSTANTS
+from chia.server.ws_connection import WSChiaConnection
+from chia.types.blockchain_format.coin import Coin
+from chia.types.blockchain_format.program import Program, run
+from chia.types.condition_opcodes import ConditionOpcode
+from chia.util.byte_types import hexstr_to_bytes
+from chia.util.errors import Err, ValidationError
+from chia.util.hash import std_hash
+from chia.wallet.cat_wallet.cat_constants import DEFAULT_CATS
+from chia.wallet.cat_wallet.cat_info import CATCoinData, CATInfo, CRCATInfo, LegacyCATInfo
+from chia.wallet.cat_wallet.cat_utils import (
+    CAT_MOD,
+    CAT_MOD_HASH,
+    CAT_MOD_HASH_HASH,
+    QUOTED_CAT_MOD_HASH,
+    SpendableCAT,
+    chia_mojos_claimed_for_melt,
+    construct_cat_puzzle,
+    match_cat_puzzle,
+    unsigned_spend_bundle_for_spendable_cats,
+)
+from chia.wallet.cat_wallet.lineage_store import CATLineageStore
+from chia.wallet.coin_selection import select_coins
+from chia.wallet.conditions import (
+    AssertCoinAnnouncement,
+    Condition,
+    ConditionValidTimes,
+    CreateCoin,
+    CreateCoinAnnouncement,
+    UnknownCondition,
+)
+from chia.wallet.derivation_record import DerivationRecord
+from chia.wallet.lineage_proof import LineageProof
+from chia.wallet.outer_puzzles import AssetType
+from chia.wallet.puzzle_drivers import PuzzleInfo
+from chia.wallet.puzzles.tails import ALL_LIMITATIONS_PROGRAMS
+from chia.wallet.transaction_record import TransactionRecord
+from chia.wallet.uncurried_puzzle import uncurry_puzzle
+from chia.wallet.util.compute_additions import compute_additions_with_cost
+from chia.wallet.util.compute_hints import compute_spend_hints_and_additions
+from chia.wallet.util.curry_and_treehash import curry_and_treehash
+from chia.wallet.util.transaction_type import TransactionType
+from chia.wallet.util.wallet_sync_utils import fetch_coin_spend_for_coin_state
+from chia.wallet.util.wallet_types import WalletIdentifier, WalletType
+from chia.wallet.vc_wallet.cr_cat_drivers import CRCAT, ProofsChecker, construct_pending_approval_state
+from chia.wallet.vc_wallet.vc_drivers import match_revocation_layer
+from chia.wallet.wallet import Wallet
+from chia.wallet.wallet_action_scope import WalletActionScope
+from chia.wallet.wallet_coin_record import WalletCoinRecord
+from chia.wallet.wallet_info import WalletInfo
+from chia.wallet.wallet_protocol import GSTOptionalArgs, WalletProtocol
+from chia.wallet.wallet_spend_bundle import WalletSpendBundle
+
+if TYPE_CHECKING:
+    from chia.wallet.wallet_state_manager import WalletStateManager
+
+
+def not_ephemeral_additions(sp: WalletSpendBundle) -> list[Coin]:
+    removals: set[Coin] = set()
+    for cs in sp.coin_spends:
+        removals.add(cs.coin)
+
+    additions: list[Coin] = []
+    max_cost = int(DEFAULT_CONSTANTS.MAX_BLOCK_COST_CLVM)
+    for cs in sp.coin_spends:
+        coins, cost = compute_additions_with_cost(cs, max_cost=max_cost)
+        max_cost -= cost
+        if max_cost < 0:
+            raise ValidationError(Err.BLOCK_COST_EXCEEDS_MAX, "non_ephemeral_additions() for SpendBundle")
+        for c in coins:
+            if c not in removals:
+                additions.append(c)
+    return additions
+
+
+class CATWallet:
+    if TYPE_CHECKING:
+        _protocol_check: ClassVar[WalletProtocol] = cast("CATWallet", None)
+
+    wallet_state_manager: WalletStateManager
+    log: logging.Logger
+    wallet_info: WalletInfo
+    cat_info: CATInfo
+    standard_wallet: Wallet
+    lineage_store: CATLineageStore
+    tail_hash: bytes32
+    wallet_type: ClassVar[WalletType] = WalletType.CAT
+
+    # We only need the puzzle hash method so we'll leave this unimplemented for now
+    puzzle_for_pk = None
+
+    @staticmethod
+    def default_wallet_name_for_unknown_cat(limitations_program_hash: bytes32) -> str:
+        return f"CAT {limitations_program_hash.hex()[:16]}..."
+
+    @staticmethod
+    async def create_new_cat_wallet(
+        wallet_state_manager: WalletStateManager,
+        wallet: Wallet,
+        cat_tail_info: dict[str, Any],
+        amount: uint64,
+        action_scope: WalletActionScope,
+        fee: uint64 = uint64(0),
+        name: str | None = None,
+        push: bool = True,
+    ) -> CATWallet:
+        self = CATWallet()
+        self.standard_wallet = wallet
+        self.log = logging.getLogger(__name__)
+        std_wallet_id = self.standard_wallet.wallet_id
+        bal = await wallet_state_manager.get_confirmed_balance_for_wallet(std_wallet_id)
+        if amount > bal:
+            raise ValueError("Not enough balance")
+        self.wallet_state_manager = wallet_state_manager
+
+        # We use 00 bytes because it's not optional. We must check this is overridden during issuance.
+        empty_bytes = bytes32(32 * b"\0")
+        self.cat_info = CATInfo(empty_bytes, None)
+        info_as_string = bytes(self.cat_info).hex()
+        # If the name is not provided, it will be autogenerated based on the resulting tail hash.
+        # For now, give the wallet a temporary name "CAT WALLET" until we get the tail hash
+        original_name = name
+        if name is None:
+            name = "CAT WALLET"
+
+        self.wallet_info = await wallet_state_manager.user_store.create_wallet(name, self.wallet_type, info_as_string)
+
+        try:
+            spend_bundle = await ALL_LIMITATIONS_PROGRAMS[cat_tail_info["identifier"]].generate_issuance_bundle(
+                self,
+                cat_tail_info,
+                amount,
+                action_scope,
+                fee,
+            )
+            assert self.cat_info.limitations_program_hash != empty_bytes
+        except Exception:
+            await wallet_state_manager.delete_wallet(self.id())
+            raise
+        if spend_bundle is None:
+            await wallet_state_manager.delete_wallet(self.id())
+            raise ValueError("Failed to create spend.")
+
+        self.tail_hash = self.cat_info.limitations_program_hash
+        await self.wallet_state_manager.add_new_wallet(self)
+
+        # If the new CAT name wasn't originally provided, we used a temporary name before issuance
+        # since we didn't yet know the TAIL. Now we know the TAIL, we can update the name
+        # according to the template name for unknown/new CATs.
+        if original_name is None:
+            name = self.default_wallet_name_for_unknown_cat(self.cat_info.limitations_program_hash)
+            await self.set_name(name)
+
+        # Change and actual CAT coin
+        non_ephemeral_coins: list[Coin] = not_ephemeral_additions(spend_bundle)
+        cat_coin = None
+        puzzle_store = self.wallet_state_manager.puzzle_store
+        for c in non_ephemeral_coins:
+            wallet_identifier = await puzzle_store.get_wallet_identifier_for_puzzle_hash(c.puzzle_hash)
+            if wallet_identifier is None:
+                raise ValueError("Internal Error")
+            if wallet_identifier.id == self.id():
+                cat_coin = c
+
+        if cat_coin is None:
+            raise ValueError("Internal Error, unable to generate new CAT coin")
+        cat_pid: bytes32 = cat_coin.parent_coin_info
+
+        converted_ph = await self.convert_puzzle_hash(cat_coin.puzzle_hash)
+        cat_record = TransactionRecord(
+            confirmed_at_height=uint32(0),
+            created_at_time=uint64(time.time()),
+            to_puzzle_hash=converted_ph,
+            to_address=self.wallet_state_manager.encode_puzzle_hash(converted_ph),
+            amount=uint64(cat_coin.amount),
+            fee_amount=fee,
+            confirmed=False,
+            sent=uint32(10),
+            spend_bundle=spend_bundle,
+            additions=[cat_coin],
+            removals=list(filter(lambda rem: rem.name() == cat_pid, spend_bundle.removals())),
+            wallet_id=self.id(),
+            sent_to=[],
+            trade_id=None,
+            type=uint32(TransactionType.INCOMING_TX.value),
+            name=spend_bundle.name(),
+            memos={},
+            valid_times=ConditionValidTimes(),
+        )
+        async with action_scope.use() as interface:
+            interface.side_effects.transactions.append(cat_record)
+        return self
+
+    @classmethod
+    async def get_or_create_wallet_for_cat(
+        cls,
+        wallet_state_manager: WalletStateManager,
+        wallet: Wallet,
+        limitations_program_hash: bytes32,
+        name: str | None = None,
+    ) -> Self:
+        self = cls()
+        self.standard_wallet = wallet
+        self.log = logging.getLogger(__name__)
+
+        for id, w in wallet_state_manager.wallets.items():
+            if w.type() == cls.type():
+                assert isinstance(w, cls)
+                if w.get_asset_id() == limitations_program_hash:
+                    self.log.warning("Not creating wallet for already existing CAT wallet")
+                    return w
+
+        self.wallet_state_manager = wallet_state_manager
+        if limitations_program_hash.hex() in DEFAULT_CATS:
+            cat_info = DEFAULT_CATS[limitations_program_hash.hex()]
+            name = cat_info["name"]
+        elif name is None:
+            name = self.default_wallet_name_for_unknown_cat(limitations_program_hash)
+
+        self.cat_info = CATInfo(limitations_program_hash, None)
+        info_as_string = bytes(self.cat_info).hex()
+        self.wallet_info = await wallet_state_manager.user_store.create_wallet(name, self.wallet_type, info_as_string)
+        self.tail_hash = self.cat_info.limitations_program_hash
+
+        self.lineage_store = await CATLineageStore.create(self.wallet_state_manager.db_wrapper, self.get_asset_id())
+        await self.wallet_state_manager.add_new_wallet(self)
+
+        delete: bool = False
+        for state in await self.wallet_state_manager.interested_store.get_unacknowledged_states_for_asset_id(
+            limitations_program_hash
+        ):
+            new_peer = self.wallet_state_manager.wallet_node.get_full_node_peer()
+            if new_peer is not None:
+                delete = True
+                peer_id: bytes32 = new_peer.peer_node_id
+                await self.wallet_state_manager.retry_store.add_state(state[0], peer_id, state[1])
+
+        if delete:
+            await self.wallet_state_manager.interested_store.delete_unacknowledged_states_for_asset_id(
+                limitations_program_hash
+            )
+
+        return self
+
+    @classmethod
+    async def create_from_puzzle_info(
+        cls,
+        wallet_state_manager: WalletStateManager,
+        wallet: Wallet,
+        puzzle_driver: PuzzleInfo,
+        name: str | None = None,
+        # We're hinting this as Any for mypy by should explore adding this to the wallet protocol and hinting properly
+        potential_subclasses: dict[AssetType, Any] | None = None,
+    ) -> Any:
+        if potential_subclasses is None:
+            potential_subclasses = {}
+
+        next_layer: PuzzleInfo | None = puzzle_driver.also()
+        if next_layer is not None:
+            if AssetType(next_layer.type()) in potential_subclasses:
+                return await potential_subclasses[AssetType(next_layer.type())].create_from_puzzle_info(
+                    wallet_state_manager,
+                    wallet,
+                    puzzle_driver,
+                    name,
+                    potential_subclasses,
+                )
+        return await cls.get_or_create_wallet_for_cat(
+            wallet_state_manager,
+            wallet,
+            puzzle_driver["tail"],
+            name,
+        )
+
+    @classmethod
+    async def create(
+        cls,
+        wallet_state_manager: WalletStateManager,
+        wallet: Wallet,
+        wallet_info: WalletInfo,
+    ) -> Self:
+        self = cls()
+
+        self.log = logging.getLogger(__name__)
+
+        self.wallet_state_manager = wallet_state_manager
+        self.wallet_info = wallet_info
+        self.standard_wallet = wallet
+        try:
+            self.cat_info = CATInfo.from_bytes(hexstr_to_bytes(self.wallet_info.data))
+            self.tail_hash = self.cat_info.limitations_program_hash
+            self.lineage_store = await CATLineageStore.create(self.wallet_state_manager.db_wrapper, self.get_asset_id())
+        except (AssertionError, ValueError):
+            # Do a migration of the lineage proofs
+            cat_info = LegacyCATInfo.from_bytes(hexstr_to_bytes(self.wallet_info.data))
+            self.cat_info = CATInfo(cat_info.limitations_program_hash, cat_info.my_tail)
+            self.tail_hash = self.cat_info.limitations_program_hash
+            self.lineage_store = await CATLineageStore.create(self.wallet_state_manager.db_wrapper, self.get_asset_id())
+            for coin_id, lineage in cat_info.lineage_proofs:
+                await self.add_lineage(coin_id, lineage)
+            await self.save_info(self.cat_info)
+
+        return self
+
+    @classmethod
+    def type(cls) -> WalletType:
+        return cls.wallet_type
+
+    def id(self) -> uint32:
+        return self.wallet_info.id
+
+    async def get_confirmed_balance(self, record_list: set[WalletCoinRecord] | None = None) -> uint128:
+        if record_list is None:
+            record_list = await self.wallet_state_manager.coin_store.get_unspent_coins_for_wallet(self.id())
+
+        amount: uint128 = uint128(0)
+        for record in record_list:
+            lineage = await self.get_lineage_proof_for_coin(record.coin)
+            if lineage is not None:
+                amount = uint128(amount + record.coin.amount)
+
+        self.log.info(f"Confirmed balance for cat wallet {self.id()} is {amount}")
+        return uint128(amount)
+
+    async def get_unconfirmed_balance(self, unspent_records: set[WalletCoinRecord] | None = None) -> uint128:
+        return await self.wallet_state_manager.get_unconfirmed_balance(self.id(), unspent_records)
+
+    @property
+    def cost_of_single_tx(self) -> int:
+        return 30000000  # Estimate
+
+    @property
+    def max_send_quantity(self) -> int:
+        # avoid full block TXs
+        return int(self.wallet_state_manager.constants.MAX_BLOCK_COST_CLVM / 2 / self.cost_of_single_tx)
+
+    async def get_max_send_amount(self, records: set[WalletCoinRecord] | None = None) -> uint128:
+        return uint128(
+            sum(
+                cr.coin.amount
+                for cr in await self.wallet_state_manager.get_spendable_coins_for_wallet(
+                    self.id(), records, in_one_block=True
+                )
+            )
+        )
+
+    def get_name(self) -> str:
+        return self.wallet_info.name
+
+    async def set_name(self, new_name: str) -> None:
+        new_info = dataclasses.replace(self.wallet_info, name=new_name)
+        self.wallet_info = new_info
+        await self.wallet_state_manager.user_store.update_wallet(self.wallet_info)
+
+    def get_asset_id(self) -> bytes32:
+        return self.tail_hash
+
+    async def coin_added(self, coin: Coin, height: uint32, peer: WSChiaConnection, coin_data: object | None) -> None:
+        """Notification from wallet state manager that wallet has been received."""
+        self.log.info(f"CAT wallet has been notified that {coin.name().hex()} was added")
+        if coin_data is not None:
+            assert isinstance(coin_data, CATCoinData)
+
+        inner_puzzle = await self.inner_puzzle_for_cat_puzhash(coin.puzzle_hash)
+        lineage_proof = LineageProof(coin.parent_coin_info, inner_puzzle.get_tree_hash(), uint64(coin.amount))
+        await self.add_lineage(coin.name(), lineage_proof)
+
+        lineage = await self.get_lineage_proof_for_coin(coin)
+
+        if lineage is None:
+            try:
+                if coin_data is None:
+                    # The method is not triggered after the determine_coin_type, no pre-fetched data.
+                    # After a day the node deletes the parent's spent row. The creation block still has it.
+                    coin_state = await self.wallet_state_manager.wallet_node.get_coin_state(
+                        [coin.parent_coin_info], peer=peer
+                    )
+                    if len(coin_state) == 0:
+                        coin_state = await self.wallet_state_manager._parent_spent_in_creation_block(
+                            peer, CoinState(coin, None, height)
+                        )
+                    if len(coin_state) == 0:
+                        return
+                    assert coin_state[0].coin.name() == coin.parent_coin_info
+                    coin_spend = await fetch_coin_spend_for_coin_state(coin_state[0], peer)
+                    cat_curried_args = match_cat_puzzle(uncurry_puzzle(coin_spend.puzzle_reveal))
+                    if cat_curried_args is not None:
+                        cat_mod_hash, tail_program_hash, cat_inner_puzzle = cat_curried_args
+                        coin_data = CATCoinData(
+                            bytes32(cat_mod_hash.as_atom()),
+                            bytes32(tail_program_hash.as_atom()),
+                            cat_inner_puzzle,
+                            coin_state[0].coin.parent_coin_info,
+                            uint64(coin_state[0].coin.amount),
+                        )
+                await self.puzzle_solution_received(coin, coin_data)
+            except Exception as e:
+                self.log.debug(f"Exception: {e}, traceback: {traceback.format_exc()}")
+
+    async def puzzle_solution_received(self, coin: Coin, parent_coin_data: CATCoinData | None) -> None:
+        coin_name = coin.parent_coin_info
+        if parent_coin_data is not None:
+            assert isinstance(parent_coin_data, CATCoinData)
+            data: CATCoinData = parent_coin_data
+            self.log.info(f"parent: {coin_name.hex()} inner_puzzle for parent is {data.inner_puzzle}")
+
+            await self.add_lineage(
+                coin_name,
+                LineageProof(data.parent_coin_id, data.inner_puzzle.get_tree_hash(), data.amount),
+            )
+        else:
+            # The parent is not a CAT which means we need to scrub all of its children from our DB
+            child_coin_records = await self.wallet_state_manager.coin_store.get_coin_records_by_parent_id(coin_name)
+            if len(child_coin_records) > 0:
+                for record in child_coin_records:
+                    if record.wallet_id == self.id():
+                        await self.wallet_state_manager.coin_store.delete_coin_record(record.coin.name())
+                        await self.remove_lineage(record.coin.name())
+                        # We also need to make sure there's no record of the transaction
+                        await self.wallet_state_manager.tx_store.delete_transaction_record(record.coin.name())
+
+    @classmethod
+    async def identify(
+        cls,
+        wallet_state_manager: WalletStateManager,
+        parent_data: CATCoinData,
+        parent_coin_state: CoinState,
+        coin_state: CoinState,
+        coin_spend: CoinSpend,
+        fork_height: uint32 | None,
+    ) -> WalletIdentifier | None:
+        """
+        Handle the new coin when it is a CAT
+        :param parent_data: Parent CAT coin uncurried metadata
+        :param parent_coin_state: Parent coin state
+        :param coin_state: Current coin state
+        :param coin_spend: New coin spend
+        :param fork_height: Current block height
+        :return: Wallet ID & Wallet Type
+        """
+        # This function living here is a smidge problematic because it handles all the types of CATWallets
+        from chia.wallet.cat_wallet.r_cat_wallet import RCATWallet
+        from chia.wallet.vc_wallet.cr_cat_wallet import CRCATWallet
+
+        hinted_coin = compute_spend_hints_and_additions(coin_spend)[0][coin_state.coin.name()]
+        assert hinted_coin.hint is not None, f"hint missing for coin {hinted_coin.coin}"
+        derivation_record = await wallet_state_manager.puzzle_store.get_derivation_record_for_puzzle_hash(
+            hinted_coin.hint
+        )
+
+        if derivation_record is None:
+            wallet_state_manager.log.info(f"Received state for the coin that doesn't belong to us {coin_state}")
+            return None
+        else:
+            our_inner_puzzle: Program = wallet_state_manager.main_wallet.puzzle_for_pk(derivation_record.pubkey)
+            asset_id: bytes32 = parent_data.tail_program_hash
+            cat_puzzle = construct_cat_puzzle(CAT_MOD, asset_id, our_inner_puzzle, CAT_MOD_HASH)
+            wallet_type: type[CATWallet] = CATWallet
+            crcat = None
+            if cat_puzzle.get_tree_hash() != coin_state.coin.puzzle_hash:
+                # Check if it is a special type of CAT
+                uncurried_puzzle_reveal = uncurry_puzzle(coin_spend.puzzle_reveal)
+                if uncurried_puzzle_reveal.mod != CAT_MOD:
+                    return None
+                revocation_layer_match = match_revocation_layer(uncurry_puzzle(uncurried_puzzle_reveal.args.at("rrf")))
+                if revocation_layer_match is not None:
+                    wallet_type = RCATWallet
+                else:
+                    try:
+                        next_crcats = CRCAT.get_next_from_coin_spend(coin_spend)
+
+                    except ValueError:
+                        return None
+
+                    crcat = next(crc for crc in next_crcats if crc.coin == coin_state.coin)
+
+                    wallet_type = CRCATWallet
+            if wallet_type is CRCATWallet:
+                assert crcat is not None  # mypy doesn't get the semantics
+                # Since CRCAT wallet doesn't have derivation path, every CRCAT will go through this code path
+                # Make sure we control the inner puzzle or we control it if it's wrapped in the pending state
+                if (
+                    await wallet_state_manager.puzzle_store.get_derivation_record_for_puzzle_hash(
+                        crcat.inner_puzzle_hash
+                    )
+                    is None
+                    and crcat.inner_puzzle_hash
+                    != construct_pending_approval_state(
+                        hinted_coin.hint,
+                        uint64(coin_state.coin.amount),
+                    ).get_tree_hash()
+                ):
+                    wallet_state_manager.log.error(
+                        f"Unknown CRCAT inner puzzle, coin ID:{crcat.coin.name().hex()}"
+                    )  # pragma: no cover
+                    return None  # pragma: no cover
+
+                # Check if we already have a wallet
+                for wallet_info in await wallet_state_manager.get_all_wallet_info_entries(wallet_type=WalletType.CRCAT):
+                    crcat_info: CRCATInfo = CRCATInfo.from_bytes(bytes.fromhex(wallet_info.data))
+                    if crcat_info.limitations_program_hash == asset_id:
+                        return WalletIdentifier(wallet_info.id, WalletType(wallet_info.type))
+
+            if wallet_type in {CRCATWallet, RCATWallet}:
+                # We didn't find a matching alt-CAT wallet, but maybe we have a matching CAT wallet that we can convert
+                for wallet_info in await wallet_state_manager.get_all_wallet_info_entries(wallet_type=WalletType.CAT):
+                    cat_info: CATInfo = CATInfo.from_bytes(bytes.fromhex(wallet_info.data))
+                    found_cat_wallet = wallet_state_manager.wallets[wallet_info.id]
+                    assert isinstance(found_cat_wallet, CATWallet)
+                    if cat_info.limitations_program_hash == asset_id:
+                        if wallet_type is CRCATWallet:
+                            assert crcat is not None  # again, mypy isn't this smart
+                            await CRCATWallet.convert_to_cr(
+                                found_cat_wallet,
+                                crcat.authorized_providers,
+                                ProofsChecker.from_program(uncurry_puzzle(crcat.proofs_checker)),
+                            )
+                            wallet_state_manager.state_changed("converted cat wallet to cr", wallet_info.id)
+                            return WalletIdentifier(wallet_info.id, WalletType(WalletType.CRCAT))
+                        elif wallet_type is RCATWallet:
+                            success = await RCATWallet.convert_to_revocable(
+                                found_cat_wallet,
+                                # too complicated for mypy but semantics guarantee this not to be None
+                                hidden_puzzle_hash=revocation_layer_match[0],  # type: ignore[index]
+                            )
+                            if success:
+                                wallet_state_manager.state_changed("converted cat wallet to revocable", wallet_info.id)
+                                return WalletIdentifier(wallet_info.id, WalletType(WalletType.CRCAT))
+                            # The plain CAT already has coins, so it stays a plain CAT.
+                            # The incoming revocable coin still needs its own wallet below.
+
+            if (
+                parent_data.tail_program_hash.hex() in wallet_state_manager.default_cats
+                or wallet_state_manager.config.get("automatically_add_unknown_cats", False)
+            ):
+                if wallet_type is CRCATWallet:
+                    assert crcat is not None
+                    cat_wallet: CATWallet = await CRCATWallet.get_or_create_wallet_for_cat(
+                        wallet_state_manager,
+                        wallet_state_manager.main_wallet,
+                        crcat.tail_hash,
+                        authorized_providers=crcat.authorized_providers,
+                        proofs_checker=ProofsChecker.from_program(uncurry_puzzle(crcat.proofs_checker)),
+                    )
+                elif wallet_type is RCATWallet:
+                    cat_wallet = await RCATWallet.get_or_create_wallet_for_cat(
+                        wallet_state_manager,
+                        wallet_state_manager.main_wallet,
+                        parent_data.tail_program_hash,
+                        # too complicated for mypy but semantics guarantee this not to be None
+                        hidden_puzzle_hash=revocation_layer_match[0],  # type: ignore[index]
+                    )
+                else:
+                    cat_wallet = await CATWallet.get_or_create_wallet_for_cat(
+                        wallet_state_manager,
+                        wallet_state_manager.main_wallet,
+                        parent_data.tail_program_hash,
+                    )
+                return WalletIdentifier.create(cat_wallet)
+            else:
+                # Found unacknowledged CAT, save it in the database.
+                await wallet_state_manager.interested_store.add_unacknowledged_token(
+                    asset_id,
+                    CATWallet.default_wallet_name_for_unknown_cat(asset_id),
+                    None if parent_coin_state.spent_height is None else uint32(parent_coin_state.spent_height),
+                    parent_coin_state.coin.puzzle_hash,
+                )
+                await wallet_state_manager.interested_store.add_unacknowledged_coin_state(
+                    asset_id,
+                    coin_state,
+                    fork_height,
+                )
+                wallet_state_manager.state_changed("added_stray_cat")
+                return None
+
+    def require_derivation_paths(self) -> bool:
+        return True
+
+    def puzzle_hash_for_pk(self, pubkey: G1Element) -> bytes32:
+        inner_puzzle_hash = self.standard_wallet.puzzle_hash_for_pk(pubkey)
+        limitations_program_hash_hash = Program.to(self.tail_hash).get_tree_hash()
+        return curry_and_treehash(
+            QUOTED_CAT_MOD_HASH, CAT_MOD_HASH_HASH, limitations_program_hash_hash, inner_puzzle_hash
+        )
+
+    async def get_cat_puzzle_hash(self, new: bool) -> bytes32:
+        if new:
+            return (await self.wallet_state_manager.get_unused_derivation_record(self.id())).puzzle_hash
+        else:
+            derivation_record = await self.wallet_state_manager.get_current_derivation_record_for_wallet(self.id())
+            if derivation_record is None:
+                return (await self.wallet_state_manager.get_unused_derivation_record(self.id())).puzzle_hash
+
+            return derivation_record.puzzle_hash
+
+    async def get_spendable_balance(self, unspent_records: set[WalletCoinRecord] | None = None) -> uint128:
+        coins = await self.wallet_state_manager.get_spendable_coins_for_wallet(self.id(), unspent_records)
+        amount = 0
+        for record in coins:
+            amount += record.coin.amount
+
+        return uint128(amount)
+
+    async def get_pending_change_balance(self) -> uint64:
+        unconfirmed_tx = await self.wallet_state_manager.tx_store.get_unconfirmed_for_wallet(self.id())
+        addition_amount = 0
+        for record in unconfirmed_tx:
+            if not record.is_in_mempool() and record.spend_bundle is not None:
+                continue
+            our_spend = False
+            for coin in record.removals:
+                if await self.wallet_state_manager.does_coin_belong_to_wallet(coin, self.id()):
+                    our_spend = True
+                    break
+
+            if our_spend is not True:
+                continue
+
+            for coin in record.additions:
+                hint_dict = {
+                    coin_id: bytes32(memos[0])
+                    for coin_id, memos in record.memos.items()
+                    if len(memos) > 0 and len(memos[0]) == 32
+                }
+                if await self.wallet_state_manager.does_coin_belong_to_wallet(coin, self.id(), hint_dict=hint_dict):
+                    addition_amount += coin.amount
+
+        return uint64(addition_amount)
+
+    async def is_coin_spendable(self, record: WalletCoinRecord) -> bool:
+        lineage = await self.get_lineage_proof_for_coin(record.coin)
+        return lineage is not None and not lineage.is_none()
+
+    async def select_coins(
+        self,
+        amount: uint64,
+        action_scope: WalletActionScope,
+    ) -> set[Coin]:
+        """
+        Returns a set of coins that can be used for generating a new transaction.
+        Note: Must be called under wallet state manager lock
+        """
+        spendable_amount: uint128 = await self.get_spendable_balance()
+        spendable_coins: list[WalletCoinRecord] = list(
+            await self.wallet_state_manager.get_spendable_coins_for_wallet(self.id(), in_one_block=True)
+        )
+
+        # Try to use coins from the store, if there isn't enough of "unused"
+        # coins use change coins that are not confirmed yet
+        unconfirmed_removals: dict[bytes32, Coin] = await self.wallet_state_manager.unconfirmed_removals_for_wallet(
+            self.id()
+        )
+        async with action_scope.use() as interface:
+            coins = await select_coins(
+                spendable_amount,
+                action_scope.config.adjust_for_side_effects(interface.side_effects).tx_config.coin_selection_config,
+                spendable_coins,
+                unconfirmed_removals,
+                self.log,
+                uint128(amount),
+            )
+            interface.side_effects.selected_coins.extend([*coins])
+        assert sum(c.amount for c in coins) >= amount
+        return coins
+
+    async def inner_puzzle_for_cat_puzhash(self, cat_hash: bytes32) -> Program:
+        record: (
+            DerivationRecord | None
+        ) = await self.wallet_state_manager.puzzle_store.get_derivation_record_for_puzzle_hash(cat_hash)
+        if record is None:
+            raise RuntimeError(f"Missing Derivation Record for CAT puzzle_hash {cat_hash}")
+        inner_puzzle: Program = self.standard_wallet.puzzle_for_pk(record.pubkey)
+        return inner_puzzle
+
+    async def convert_puzzle_hash(self, puzzle_hash: bytes32) -> bytes32:
+        record: (
+            DerivationRecord | None
+        ) = await self.wallet_state_manager.puzzle_store.get_derivation_record_for_puzzle_hash(puzzle_hash)
+        if record is None:
+            return puzzle_hash  # TODO: check if we have a test for this case!
+        else:
+            return (await self.inner_puzzle_for_cat_puzhash(puzzle_hash)).get_tree_hash()
+
+    async def get_lineage_proof_for_coin(self, coin: Coin) -> LineageProof | None:
+        return await self.lineage_store.get_lineage_proof(coin.parent_coin_info)
+
+    async def create_tandem_xch_tx(
+        self,
+        fee: uint64,
+        amount_to_claim: uint64,
+        action_scope: WalletActionScope,
+        extra_conditions: tuple[Condition, ...] = tuple(),
+    ) -> AssertCoinAnnouncement | None:
+        """
+        This function creates a non-CAT transaction to pay fees, contribute funds for issuance, and absorb melt value.
+        It is meant to be called in `generate_unsigned_spendbundle` and as such should be called under the
+        wallet_state_manager lock
+        """
+        announcement: AssertCoinAnnouncement | None = None
+        async with self.wallet_state_manager.new_action_scope(
+            action_scope.config.tx_config.override(primary_coin=None, included_coin_ids=[]), push=False
+        ) as inner_action_scope:
+            if fee > amount_to_claim:
+                chia_coins = await self.standard_wallet.select_coins(
+                    fee,
+                    inner_action_scope,
+                )
+                origin_id = next(iter(chia_coins)).name()
+                await self.standard_wallet.generate_signed_transaction(
+                    [],
+                    [],
+                    inner_action_scope,
+                    fee=uint64(fee - amount_to_claim),
+                    coins=chia_coins,
+                    origin_id=origin_id,  # We specify this so that we know the coin that is making the announcement
+                    negative_change_allowed=False,
+                    extra_conditions=extra_conditions,
+                )
+            else:
+                chia_coins = await self.standard_wallet.select_coins(
+                    fee,
+                    inner_action_scope,
+                )
+                origin_id = next(iter(chia_coins)).name()
+                selected_amount = sum(c.amount for c in chia_coins)
+                await self.standard_wallet.generate_signed_transaction(
+                    [uint64(selected_amount + amount_to_claim - fee)],
+                    [await action_scope.get_puzzle_hash(self.wallet_state_manager)],
+                    inner_action_scope,
+                    coins=chia_coins,
+                    negative_change_allowed=True,
+                    extra_conditions=extra_conditions,
+                )
+
+        message = None
+        for tx in inner_action_scope.side_effects.transactions:
+            if tx.spend_bundle is None:
+                continue
+            for spend in tx.spend_bundle.coin_spends:
+                if spend.coin.name() == origin_id:
+                    conditions = run(spend.puzzle_reveal, Program.from_serialized(spend.solution)).as_python()
+                    for condition in conditions:
+                        if condition[0] == ConditionOpcode.CREATE_COIN_ANNOUNCEMENT:
+                            message = condition[1]
+
+        assert message is not None
+        announcement = AssertCoinAnnouncement(asserted_id=origin_id, asserted_msg=message)
+
+        async with action_scope.use() as interface:
+            interface.side_effects.transactions.extend(inner_action_scope.side_effects.transactions)
+            interface.side_effects.selected_coins.extend(inner_action_scope.side_effects.selected_coins)
+
+        return announcement
+
+    async def make_inner_solution(
+        self,
+        coin: Coin,
+        primaries: list[CreateCoin],
+        conditions: tuple[Condition, ...] = tuple(),
+    ) -> Program:
+        return self.standard_wallet.make_solution(primaries=primaries, conditions=conditions)
+
+    async def generate_unsigned_spendbundle(
+        self,
+        payments: list[CreateCoin],
+        action_scope: WalletActionScope,
+        fee: uint64 = uint64(0),
+        cat_discrepancy: tuple[int, Program, Program] | None = None,  # (extra_delta, tail_reveal, tail_solution)
+        coins: set[Coin] | None = None,
+        extra_conditions: tuple[Condition, ...] = tuple(),
+    ) -> WalletSpendBundle:
+        if cat_discrepancy is not None:
+            extra_delta, tail_reveal, tail_solution = cat_discrepancy
+        else:
+            extra_delta, tail_reveal, tail_solution = 0, Program.to([]), Program.to([])
+        payment_amount: int = sum(p.amount for p in payments)
+        starting_amount: int = payment_amount - extra_delta
+        if coins is None:
+            cat_coins_set = await self.select_coins(
+                uint64(starting_amount),
+                action_scope,
+            )
+        else:
+            cat_coins_set = coins
+
+        cat_coins = list(
+            sorted(
+                cat_coins_set,
+                key=lambda c: c.name() == action_scope.config.tx_config.coin_selection_config.primary_coin,
+                reverse=True,
+            )
+        )
+
+        selected_cat_amount = sum(c.amount for c in cat_coins)
+        assert selected_cat_amount >= starting_amount
+
+        # Figure out if we need to absorb/melt some XCH as part of this
+        regular_chia_to_claim: int = 0
+        if payment_amount > starting_amount:
+            fee = uint64(fee + payment_amount - starting_amount)
+        else:
+            regular_chia_to_claim = chia_mojos_claimed_for_melt(payment_amount, extra_delta)
+
+        need_chia_transaction = (fee > 0 or regular_chia_to_claim > 0) and (fee - regular_chia_to_claim != 0)
+
+        # Calculate standard puzzle solutions
+        change = selected_cat_amount - starting_amount
+        primaries = payments.copy()
+
+        if change > 0:
+            derivation_record = await self.wallet_state_manager.puzzle_store.get_derivation_record_for_puzzle_hash(
+                next(iter(cat_coins)).puzzle_hash
+            )
+            if derivation_record is not None and action_scope.config.tx_config.reuse_puzhash:
+                change_puzhash = self.standard_wallet.puzzle_hash_for_pk(derivation_record.pubkey)
+                for payment in payments:
+                    if change_puzhash == payment.puzzle_hash and change == payment.amount:
+                        # We cannot create two coins has same id, create a new puzhash for the change
+                        change_puzhash = await action_scope.get_puzzle_hash(
+                            self.wallet_state_manager, override_reuse_puzhash_with=False
+                        )
+                        break
+            else:
+                change_puzhash = await action_scope.get_puzzle_hash(self.wallet_state_manager)
+            primaries.append(CreateCoin(change_puzhash, uint64(change), [change_puzhash]))
+
+        # Loop through the coins we've selected and gather the information we need to spend them
+        spendable_cat_list = []
+        first = True
+        announcement: CreateCoinAnnouncement | None = None
+
+        for coin in cat_coins:
+            is_first = first
+            if cat_discrepancy is not None:
+                cat_condition = UnknownCondition(
+                    opcode=Program.to(51),
+                    args=[
+                        Program.NIL,
+                        Program.to(-113),
+                        tail_reveal,
+                        tail_solution,
+                    ],
+                )
+                if first:
+                    extra_conditions = (*extra_conditions, cat_condition)
+            if first:
+                first = False
+                announcement = CreateCoinAnnouncement(std_hash(b"".join([c.name() for c in cat_coins])), coin.name())
+                if need_chia_transaction:
+                    if fee > regular_chia_to_claim:
+                        await self.create_tandem_xch_tx(
+                            fee,
+                            uint64(regular_chia_to_claim),
+                            action_scope,
+                            extra_conditions=(announcement.corresponding_assertion(),),
+                        )
+                        innersol = await self.make_inner_solution(
+                            coin=coin,
+                            primaries=primaries,
+                            conditions=(*extra_conditions, announcement),
+                        )
+                    elif regular_chia_to_claim > fee:  # pragma: no cover
+                        xch_announcement = await self.create_tandem_xch_tx(
+                            fee,
+                            uint64(regular_chia_to_claim),
+                            action_scope,
+                        )
+                        assert xch_announcement is not None
+                        innersol = await self.make_inner_solution(
+                            coin=coin,
+                            primaries=primaries,
+                            conditions=(*extra_conditions, xch_announcement, announcement),
+                        )
+                    else:
+                        # TODO: what about when they are equal?
+                        raise Exception("Equality not handled")
+                else:
+                    innersol = await self.make_inner_solution(
+                        coin=coin,
+                        primaries=primaries,
+                        conditions=(*extra_conditions, announcement),
+                    )
+            else:
+                assert announcement is not None
+                innersol = await self.make_inner_solution(
+                    coin=coin, primaries=[], conditions=(announcement.corresponding_assertion(),)
+                )
+            inner_puzzle = await self.inner_puzzle_for_cat_puzhash(coin.puzzle_hash)
+            lineage_proof = await self.get_lineage_proof_for_coin(coin)
+            assert lineage_proof is not None
+            new_spendable_cat = SpendableCAT(
+                coin,
+                self.tail_hash,
+                inner_puzzle,
+                innersol,
+                limitations_solution=tail_solution,
+                extra_delta=extra_delta if is_first else 0,
+                lineage_proof=lineage_proof,
+                limitations_program_reveal=tail_reveal,
+            )
+            spendable_cat_list.append(new_spendable_cat)
+
+        cat_spend_bundle = unsigned_spend_bundle_for_spendable_cats(CAT_MOD, spendable_cat_list)
+
+        return cat_spend_bundle
+
+    async def generate_signed_transaction(
+        self,
+        amounts: list[uint64],
+        puzzle_hashes: list[bytes32],
+        action_scope: WalletActionScope,
+        fee: uint64 = uint64(0),
+        coins: set[Coin] | None = None,
+        memos: list[list[bytes]] | None = None,
+        extra_conditions: tuple[Condition, ...] = tuple(),
+        **kwargs: Unpack[GSTOptionalArgs],
+    ) -> None:
+        # (extra_delta, tail_reveal, tail_solution)
+        cat_discrepancy: tuple[int, Program, Program] | None = kwargs.get("cat_discrepancy", None)
+        if memos is None:
+            memos = [[] for _ in range(len(puzzle_hashes))]
+
+        if not (len(memos) == len(puzzle_hashes) == len(amounts)):
+            raise ValueError("Memos, puzzle_hashes, and amounts must have the same length")
+
+        payments = []
+        for amount, puzhash, memo_list in zip(amounts, puzzle_hashes, memos):
+            memos_with_hint: list[bytes] = [puzhash]
+            memos_with_hint.extend(memo_list)
+            payments.append(CreateCoin(puzhash, amount, memos_with_hint))
+
+        payment_sum = sum(p.amount for p in payments)
+        spend_bundle = await self.generate_unsigned_spendbundle(
+            payments,
+            action_scope,
+            fee,
+            cat_discrepancy=cat_discrepancy,  # (extra_delta, tail_reveal, tail_solution)
+            coins=coins,
+            extra_conditions=extra_conditions,
+        )
+
+        async with action_scope.use() as interface:
+            other_tx_removals: set[Coin] = {
+                removal for tx in interface.side_effects.transactions for removal in tx.removals
+            }
+            other_tx_additions: set[Coin] = {
+                removal for tx in interface.side_effects.transactions for removal in tx.additions
+            }
+            interface.side_effects.transactions.append(
+                self.wallet_state_manager.new_outgoing_transaction(
+                    wallet_id=self.id(),
+                    puzzle_hash=puzzle_hashes[0],
+                    amount=uint64(payment_sum),
+                    fee=fee,
+                    spend_bundle=spend_bundle,
+                    additions=list(set(spend_bundle.additions()) - other_tx_additions),
+                    removals=list(set(spend_bundle.removals()) - other_tx_removals),
+                    name=spend_bundle.name(),
+                    extra_conditions=extra_conditions,
+                )
+            )
+
+    async def add_lineage(self, name: bytes32, lineage: LineageProof | None) -> None:
+        """
+        Lineage proofs are stored as a list of parent coins and the lineage proof you will need if they are the
+        parent of the coin you are trying to spend. 'If I'm your parent, here's the info you need to spend yourself'
+        """
+        self.log.info(f"Adding parent {name.hex()}: {lineage}")
+        if lineage is not None:
+            await self.lineage_store.add_lineage_proof(name, lineage)
+
+    async def remove_lineage(self, name: bytes32) -> None:
+        self.log.info(f"Removing parent {name} (probably had a non-CAT parent)")
+        await self.lineage_store.remove_lineage_proof(name)
+
+    async def save_info(self, cat_info: CATInfo) -> None:
+        self.cat_info = cat_info
+        current_info = self.wallet_info
+        data_str = bytes(cat_info).hex()
+        wallet_info = WalletInfo(current_info.id, current_info.name, current_info.type, data_str)
+        self.wallet_info = wallet_info
+        await self.wallet_state_manager.user_store.update_wallet(wallet_info)
+
+    async def match_puzzle_info(self, puzzle_driver: PuzzleInfo) -> bool:
+        return (
+            AssetType(puzzle_driver.type()) == AssetType.CAT
+            and puzzle_driver["tail"] == self.get_asset_id()
+            and puzzle_driver.also() is None
+        )
+
+    async def get_puzzle_info(self, asset_id: bytes32) -> PuzzleInfo:
+        return PuzzleInfo({"type": AssetType.CAT.value, "tail": "0x" + self.get_asset_id().hex()})
+
+    async def get_coins_to_offer(
+        self,
+        asset_id: bytes32 | None,
+        amount: uint64,
+        action_scope: WalletActionScope,
+    ) -> set[Coin]:
+        balance = await self.get_confirmed_balance()
+        if balance < amount:
+            raise Exception(f"insufficient funds in wallet {self.id()}")
+        # We need to sandbox this because this method isn't supposed to lock up the coins
+        async with self.wallet_state_manager.new_action_scope(action_scope.config.tx_config) as sandbox:
+            return await self.select_coins(amount, sandbox)
+
+    async def match_hinted_coin(self, coin: Coin, hint: bytes32) -> bool:
+        return construct_cat_puzzle(CAT_MOD, self.tail_hash, hint).get_tree_hash_precalc(hint) == coin.puzzle_hash

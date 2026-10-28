@@ -1,0 +1,505 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from typing import Any, Protocol
+
+import pytest
+from aiohttp import (
+    ClientSession,
+    ClientTimeout,
+    WSCloseCode,
+    WSMsgType,
+    WSServerHandshakeError,
+)
+from chia_rs.sized_bytes import bytes32
+from chia_rs.sized_ints import uint8, uint16, uint64
+
+import chia.server.server
+from chia._tests.conftest import ConsensusMode
+from chia._tests.util.time_out_assert import time_out_assert
+from chia.protocols import full_node_protocol
+from chia.protocols.outbound_message import Message, NodeType, make_msg
+from chia.protocols.protocol_message_types import ProtocolMessageTypes
+from chia.protocols.shared_protocol import Capability, Handshake, default_capabilities, protocol_version
+from chia.server.rate_limits import RateLimiter
+from chia.server.server import ChiaServer, ssl_context_for_client
+from chia.server.ssl_context import chia_ssl_ca_paths
+from chia.server.ws_connection import (
+    MAX_VERSION_STRING_BYTES,
+    WSChiaConnection,
+)
+from chia.simulator.block_tools import BlockTools
+from chia.simulator.full_node_simulator import FullNodeSimulator
+from chia.ssl.create_ssl import generate_ca_signed_cert
+from chia.types.peer_info import PeerInfo
+from chia.util.config import load_config
+from chia.util.errors import Err
+from chia.util.timing import adjusted_timeout
+from chia.wallet.wallet_node import WalletNode
+
+log = logging.getLogger(__name__)
+
+
+class WsMessageLike(Protocol):
+    @property
+    def type(self) -> WSMsgType: ...
+
+    @property
+    def data(self) -> Any: ...
+
+    @property
+    def extra(self) -> str | None: ...
+
+
+def not_localhost(host: str) -> bool:
+    return False
+
+
+class FakeRateLimiter:
+    def process_msg_and_check(
+        self, message: Message, our_capabilities: list[Capability], peer_capabilities: list[Capability]
+    ) -> str | None:
+        return None
+
+
+async def send_handshake_and_assert_protocol_error(
+    server_1: ChiaServer,
+    server_2: ChiaServer,
+    self_hostname: str,
+    payload: Handshake | bytes,
+    message_type: int = ProtocolMessageTypes.handshake.value,
+) -> WsMessageLike:
+    server_1.invalid_protocol_ban_seconds = 10
+    timeout = ClientTimeout(total=5)
+    async with ClientSession(timeout=timeout) as session:
+        url = f"wss://{self_hostname}:{server_1._port}/ws"
+        async with session.ws_connect(
+            url,
+            autoclose=True,
+            autoping=True,
+            ssl=server_2.ssl_client_context,
+            max_msg_size=50 * 1024 * 1024,
+        ) as ws:
+            msg = Message(uint8(message_type), None, bytes(payload))
+            await ws.send_bytes(bytes(msg))
+            response = await ws.receive()
+            assert response.type == WSMsgType.CLOSE
+            assert response.data == WSCloseCode.PROTOCOL_ERROR
+            return response
+
+
+class TestDos:
+    @pytest.mark.anyio
+    async def test_banned_host_can_not_connect(
+        self,
+        setup_two_nodes_fixture: tuple[list[FullNodeSimulator], list[tuple[WalletNode, ChiaServer]], BlockTools],
+        self_hostname: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        nodes, _, _ = setup_two_nodes_fixture
+        server_1 = nodes[0].full_node.server
+        server_2 = nodes[1].full_node.server
+
+        # Use the server_2 ssl information to connect to server_1, and send a huge message
+        timeout = ClientTimeout(total=10)
+        session = ClientSession(timeout=timeout)
+        url = f"wss://{self_hostname}:{server_1._port}/ws"
+
+        server_1.banned_peers[self_hostname] = int(time.time() + 999_999_999)
+
+        ssl_context = server_2.ssl_client_context
+        with pytest.raises(WSServerHandshakeError):
+            await session.ws_connect(
+                url, autoclose=True, autoping=True, ssl=ssl_context, max_msg_size=100 * 1024 * 1024
+            )
+        await session.close()
+
+    @pytest.mark.anyio
+    async def test_large_message_disconnect_and_ban(
+        self,
+        setup_two_nodes_fixture: tuple[list[FullNodeSimulator], list[tuple[WalletNode, ChiaServer]], BlockTools],
+        self_hostname: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        nodes, _, _ = setup_two_nodes_fixture
+        server_1 = nodes[0].full_node.server
+        server_2 = nodes[1].full_node.server
+
+        # Use the server_2 ssl information to connect to server_1, and send a huge message
+        timeout = ClientTimeout(total=10)
+        url = f"wss://{self_hostname}:{server_1._port}/ws"
+        ssl_context = server_2.ssl_client_context
+
+        async with (
+            ClientSession(timeout=timeout) as session,
+            session.ws_connect(
+                url,
+                autoclose=True,
+                autoping=True,
+                ssl=ssl_context,
+                max_msg_size=100 * 1024 * 1024,
+            ) as ws,
+        ):
+            large_msg: bytes = bytes([0] * (60 * 1024 * 1024))
+            with monkeypatch.context() as monkey_patch_context:
+                monkey_patch_context.setattr(chia.server.server, "is_localhost", not_localhost)
+                # aiohttp rejects the oversized frame from its header before
+                # reading the payload, so the server tears down the socket
+                # while the ~60MB message is still in flight. The resulting TCP
+                # reset can raise ConnectionError on send and/or discard the
+                # server's close frame, leaving the client with an abrupt
+                # CLOSED instead of a clean CLOSE carrying MESSAGE_TOO_BIG.
+                try:
+                    await ws.send_bytes(large_msg)
+                    response = await ws.receive()
+                except ConnectionError:  # pragma: no cover
+                    await time_out_assert(10, lambda: self_hostname in server_1.banned_peers)
+                    return
+                await time_out_assert(10, lambda: self_hostname in server_1.banned_peers)
+            assert response.type in {WSMsgType.CLOSE, WSMsgType.CLOSED}
+            if response.type == WSMsgType.CLOSE:
+                assert response.data == WSCloseCode.MESSAGE_TOO_BIG
+
+    @pytest.mark.anyio
+    async def test_bad_handshake_and_ban(
+        self,
+        setup_two_nodes_fixture: tuple[list[FullNodeSimulator], list[tuple[WalletNode, ChiaServer]], BlockTools],
+        self_hostname: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        nodes, _, _ = setup_two_nodes_fixture
+        server_1 = nodes[0].full_node.server
+        server_2 = nodes[1].full_node.server
+
+        server_1.invalid_protocol_ban_seconds = int(10 + adjusted_timeout(1))
+        # Use the server_2 ssl information to connect to server_1, and send a huge message
+        timeout = ClientTimeout(total=10)
+        url = f"wss://{self_hostname}:{server_1._port}/ws"
+        ssl_context = server_2.ssl_client_context
+
+        async with (
+            ClientSession(timeout=timeout) as session,
+            session.ws_connect(
+                url,
+                autoclose=True,
+                autoping=True,
+                ssl=ssl_context,
+                max_msg_size=100 * 1024 * 1024,
+            ) as ws,
+        ):
+            with monkeypatch.context() as monkey_patch_context:
+                monkey_patch_context.setattr(chia.server.server, "is_localhost", not_localhost)
+                await ws.send_bytes(bytes([1] * 1024))
+
+                response = await ws.receive()
+                await time_out_assert(10, lambda: self_hostname in server_1.banned_peers)
+
+            print(response)
+            assert response.type == WSMsgType.CLOSE
+            assert response.data == WSCloseCode.PROTOCOL_ERROR
+
+    @pytest.mark.anyio
+    async def test_invalid_protocol_handshake(
+        self,
+        setup_two_nodes_fixture: tuple[list[FullNodeSimulator], list[tuple[WalletNode, ChiaServer]], BlockTools],
+        self_hostname: str,
+    ) -> None:
+        nodes, _, _ = setup_two_nodes_fixture
+        server_1 = nodes[0].full_node.server
+        server_2 = nodes[1].full_node.server
+        handshake = Handshake("test", "0.0.32", "1.0.0.0", uint16(3456), uint8(1), [(uint16(1), "1")])
+        response = await send_handshake_and_assert_protocol_error(
+            server_1, server_2, self_hostname, handshake, message_type=2
+        )
+        assert response.type == WSMsgType.CLOSE
+        assert response.data == WSCloseCode.PROTOCOL_ERROR
+        assert response.extra == str(int(Err.INVALID_PROTOCOL_MESSAGE.value))
+
+    @pytest.mark.anyio
+    async def test_handshake_version_too_long_disconnect(
+        self,
+        setup_two_nodes_fixture: tuple[list[FullNodeSimulator], list[tuple[WalletNode, ChiaServer]], BlockTools],
+        self_hostname: str,
+    ) -> None:
+        nodes, _, _ = setup_two_nodes_fixture
+        server_1 = nodes[0].full_node.server
+        server_2 = nodes[1].full_node.server
+        long_version = "x" * (MAX_VERSION_STRING_BYTES + 1)
+        handshake = Handshake(
+            server_1._network_id,
+            protocol_version[NodeType.FULL_NODE],
+            long_version,
+            uint16(3456),
+            uint8(NodeType.FULL_NODE.value),
+            [(uint16(1), "1")],
+        )
+        await send_handshake_and_assert_protocol_error(server_1, server_2, self_hostname, handshake)
+
+    @pytest.mark.anyio
+    async def test_wrong_message_type_handshake(
+        self,
+        setup_two_nodes_fixture: tuple[list[FullNodeSimulator], list[tuple[WalletNode, ChiaServer]], BlockTools],
+        self_hostname: str,
+    ) -> None:
+        nodes, _, _ = setup_two_nodes_fixture
+        server_1 = nodes[0].full_node.server
+        server_2 = nodes[1].full_node.server
+        handshake = Handshake(
+            server_1._network_id,
+            protocol_version[NodeType.FULL_NODE],
+            "2.6.0",
+            uint16(3456),
+            uint8(NodeType.FULL_NODE.value),
+            [(uint16(1), "1")],
+        )
+        response = await send_handshake_and_assert_protocol_error(
+            server_1, server_2, self_hostname, handshake, message_type=ProtocolMessageTypes.new_peak.value
+        )
+        assert response.extra == str(int(Err.INVALID_HANDSHAKE.value))
+
+    @pytest.mark.anyio
+    async def test_wrong_network_id_handshake(
+        self,
+        setup_two_nodes_fixture: tuple[list[FullNodeSimulator], list[tuple[WalletNode, ChiaServer]], BlockTools],
+        self_hostname: str,
+    ) -> None:
+        nodes, _, _ = setup_two_nodes_fixture
+        server_1 = nodes[0].full_node.server
+        server_2 = nodes[1].full_node.server
+        handshake = Handshake(
+            "wrong-network-id",
+            protocol_version[NodeType.FULL_NODE],
+            "2.6.0",
+            uint16(3456),
+            uint8(NodeType.FULL_NODE.value),
+            [(uint16(1), "1")],
+        )
+        response = await send_handshake_and_assert_protocol_error(server_1, server_2, self_hostname, handshake)
+        assert response.extra == str(int(Err.INCOMPATIBLE_NETWORK_ID.value))
+
+    @pytest.mark.anyio
+    async def test_spam_tx(
+        self,
+        setup_two_nodes_fixture: tuple[list[FullNodeSimulator], list[tuple[WalletNode, ChiaServer]], BlockTools],
+        self_hostname: str,
+    ) -> None:
+        nodes, _, _ = setup_two_nodes_fixture
+        _full_node_1, full_node_2 = nodes
+        server_1 = nodes[0].full_node.server
+        server_2 = nodes[1].full_node.server
+
+        await server_2.start_client(PeerInfo(self_hostname, server_1.get_port()), full_node_2.full_node.on_connect)
+
+        await time_out_assert(5, lambda: len(server_1.all_connections) == 1)
+
+        ws_con: WSChiaConnection = next(iter(server_1.all_connections.values()))
+        ws_con_2: WSChiaConnection = next(iter(server_2.all_connections.values()))
+
+        ws_con.peer_info = PeerInfo("1.2.3.4", ws_con.peer_info.port)
+        ws_con_2.peer_info = PeerInfo("1.2.3.4", ws_con_2.peer_info.port)
+
+        new_tx_message = make_msg(
+            ProtocolMessageTypes.new_transaction,
+            full_node_protocol.NewTransaction(bytes32([9] * 32), uint64(0), uint64(0)),
+        )
+        for i in range(4000):
+            await ws_con._send_message(new_tx_message)
+
+        await asyncio.sleep(1)
+        assert not ws_con.closed
+
+        # Tests outbound rate limiting, we will not send too much data
+        for i in range(2000):
+            await ws_con._send_message(new_tx_message)
+
+        await asyncio.sleep(1)
+        assert not ws_con.closed
+
+        # Remove outbound rate limiter to test inbound limits
+        ws_con.outbound_rate_limiter = RateLimiter(incoming=True, percentage_of_limit=10000)
+
+        with pytest.raises(ConnectionResetError):
+            for i in range(6000):
+                await ws_con._send_message(new_tx_message)
+                await asyncio.sleep(0)
+        await asyncio.sleep(1)
+
+        def is_closed() -> bool:
+            return ws_con.closed
+
+        await time_out_assert(15, is_closed)
+
+        assert ws_con.closed
+
+        def is_banned() -> bool:
+            return "1.2.3.4" in server_2.banned_peers
+
+        await time_out_assert(15, is_banned)
+
+    @pytest.mark.anyio
+    async def test_spam_message_non_tx(
+        self,
+        setup_two_nodes_fixture: tuple[list[FullNodeSimulator], list[tuple[WalletNode, ChiaServer]], BlockTools],
+        self_hostname: str,
+    ) -> None:
+        nodes, _, _ = setup_two_nodes_fixture
+        _full_node_1, full_node_2 = nodes
+        server_1 = nodes[0].full_node.server
+        server_2 = nodes[1].full_node.server
+
+        await server_2.start_client(PeerInfo(self_hostname, server_1.get_port()), full_node_2.full_node.on_connect)
+
+        await time_out_assert(5, lambda: len(server_1.all_connections) == 1)
+
+        ws_con: WSChiaConnection = next(iter(server_1.all_connections.values()))
+        ws_con_2: WSChiaConnection = next(iter(server_2.all_connections.values()))
+
+        ws_con.peer_info = PeerInfo("1.2.3.4", ws_con.peer_info.port)
+        ws_con_2.peer_info = PeerInfo("1.2.3.4", ws_con_2.peer_info.port)
+
+        def is_closed() -> bool:
+            return ws_con.closed
+
+        new_message = make_msg(
+            ProtocolMessageTypes.request_mempool_transactions,
+            full_node_protocol.RequestMempoolTransactions(bytes([])),
+        )
+        for i in range(2):
+            await ws_con._send_message(new_message)
+        await asyncio.sleep(1)
+        assert not ws_con.closed
+
+        # Tests outbound rate limiting, we will not send too much data
+        for i in range(10):
+            await ws_con._send_message(new_message)
+
+        await asyncio.sleep(1)
+        assert not ws_con.closed
+
+        # Remove outbound rate limiter to test inbound limits
+        ws_con.outbound_rate_limiter = RateLimiter(incoming=True, percentage_of_limit=10000)
+
+        for i in range(6):
+            await ws_con._send_message(new_message)
+        await time_out_assert(15, is_closed)
+
+        # Banned
+        def is_banned() -> bool:
+            return "1.2.3.4" in server_2.banned_peers
+
+        await time_out_assert(15, is_banned)
+
+    @pytest.mark.anyio
+    async def test_spam_message_too_large(
+        self,
+        setup_two_nodes_fixture: tuple[list[FullNodeSimulator], list[tuple[WalletNode, ChiaServer]], BlockTools],
+        self_hostname: str,
+    ) -> None:
+        nodes, _, _ = setup_two_nodes_fixture
+        _full_node_1, full_node_2 = nodes
+        server_1 = nodes[0].full_node.server
+        server_2 = nodes[1].full_node.server
+
+        await server_2.start_client(PeerInfo(self_hostname, server_1.get_port()), full_node_2.full_node.on_connect)
+
+        await time_out_assert(5, lambda: len(server_1.all_connections) == 1)
+
+        ws_con: WSChiaConnection = next(iter(server_1.all_connections.values()))
+        ws_con_2: WSChiaConnection = next(iter(server_2.all_connections.values()))
+
+        ws_con.peer_info = PeerInfo("1.2.3.4", ws_con.peer_info.port)
+        ws_con_2.peer_info = PeerInfo("1.2.3.4", ws_con_2.peer_info.port)
+
+        def is_closed() -> bool:
+            return ws_con.closed
+
+        # This test drives sends manually via the private ``_send_message`` while
+        # controlling the outbound rate limiter. Stop the connection's own
+        # outbound handler first so it can't concurrently send a message that an
+        # earlier rate-limited send re-queued via ``_wait_and_retry``. Two tasks
+        # calling ``ws.send_bytes`` on the same websocket corrupts the connection
+        # (observed as a spurious cancellation on Python 3.10).
+        assert ws_con.outbound_task is not None
+        ws_con.outbound_task.cancel()
+
+        new_message = make_msg(
+            ProtocolMessageTypes.request_mempool_transactions,
+            full_node_protocol.RequestMempoolTransactions(bytes([0] * 5 * 1024 * 1024)),
+        )
+        # Tests outbound rate limiting, we will not send big messages
+        await ws_con._send_message(new_message)
+
+        await asyncio.sleep(1)
+        assert not ws_con.closed
+
+        # Remove outbound rate limiter to test inbound limits
+        ws_con.outbound_rate_limiter = FakeRateLimiter()  # type: ignore[assignment]
+
+        await ws_con._send_message(new_message)
+        await time_out_assert(15, is_closed)
+
+        # Banned
+        def is_banned() -> bool:
+            return "1.2.3.4" in server_2.banned_peers
+
+        await time_out_assert(15, is_banned)
+
+    @pytest.mark.anyio
+    @pytest.mark.limit_consensus_modes(allowed=[ConsensusMode.PLAIN], reason="save time")
+    async def test_invalid_message_format_disconnect(
+        self, one_node_one_block: tuple[FullNodeSimulator, ChiaServer, BlockTools], self_hostname: str
+    ) -> None:
+        """Invalid binary after handshake disconnects with PROTOCOL_ERROR and peer is banned."""
+        _, server, _ = one_node_one_block
+        capabilities = default_capabilities[NodeType.FULL_NODE] + [(uint16(Capability.HARD_FORK_2.value), "1")]
+        handshake = Handshake(
+            server._network_id,
+            protocol_version[NodeType.FULL_NODE],
+            "test",
+            uint16(0),
+            uint8(NodeType.FULL_NODE.value),
+            capabilities,
+        )
+        # Binary that should fail Message.from_bytes(): Message is (uint8 type, optional uint16 id, bytes data).
+        # - bytes: 4-byte big-endian length then payload. Optional: 1 byte 0/1, if 1 then uint16.
+        invalid_payloads = [
+            b"",  # EOF reading type (uint8)
+            b"\x01\x02",  # type=1, optional prefix 0x02 invalid (must be 0 or 1)
+            b"\x01\x01",  # type=1, id present, EOF reading uint16
+            b"\x01\x00\x00\x00\x00\x00\x00\x05\x11\x22",  # type=1, id=None, data len=5 but only 2 bytes
+            b"\xff\xff\xff",  # type=255, optional prefix 0xff invalid
+        ]
+        timeout = ClientTimeout(total=10)
+        url = f"wss://{self_hostname}:{server._port}/ws"
+        ca_crt_path, ca_key_path = chia_ssl_ca_paths(server.root_path, load_config(server.root_path, "config.yaml"))
+        dummy_crt_path = server.root_path / "dummy.crt"
+        dummy_key_path = server.root_path / "dummy.key"
+        generate_ca_signed_cert(ca_crt_path.read_bytes(), ca_key_path.read_bytes(), dummy_crt_path, dummy_key_path)
+        ssl_context = ssl_context_for_client(ca_crt_path, ca_key_path, dummy_crt_path, dummy_key_path)
+        async with ClientSession(timeout=timeout) as session:
+            for invalid_payload in invalid_payloads:
+                async with session.ws_connect(url, ssl=ssl_context) as ws:
+                    await ws.send_bytes(
+                        bytes(Message(uint8(ProtocolMessageTypes.handshake.value), None, bytes(handshake)))
+                    )
+                    first = await ws.receive()
+                    assert first.type == WSMsgType.BINARY, "Expected handshake response"
+
+                    await time_out_assert(5, lambda: len(server.all_connections) == 1)
+                    ws_con = next(iter(server.all_connections.values()))
+                    ws_con.peer_info = PeerInfo("1.2.3.4", ws_con.peer_info.port)
+
+                    await ws.send_bytes(invalid_payload)
+
+                    response = await ws.receive()
+                    while response.type != WSMsgType.CLOSE:
+                        response = await ws.receive()
+                    assert response.type == WSMsgType.CLOSE
+                    assert response.data == WSCloseCode.PROTOCOL_ERROR
+
+                await time_out_assert(5, lambda: "1.2.3.4" in server.banned_peers)
+
+        # Final check that peer remained banned after all iterations
+        assert "1.2.3.4" in server.banned_peers

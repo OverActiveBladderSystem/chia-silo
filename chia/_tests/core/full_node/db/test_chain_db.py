@@ -1,0 +1,236 @@
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+
+import pytest
+
+from chia.full_node.db.chain_db import ChainDB
+from chia.full_node.db.keys import META_FORMAT_VALUE, ROCKS_SUFFIX, SQLITE_SUFFIX, needs_silo_format
+from chia.full_node.db.memory import MemoryBackend
+from chia.full_node.db.path import choose_full_node_database
+from chia.util.task_referencer import create_referenced_task
+
+
+@pytest.fixture
+def chain_db() -> ChainDB:
+    return ChainDB(MemoryBackend())
+
+
+@pytest.mark.anyio
+async def test_parent_family_is_dropped_on_open(tmp_path: Path) -> None:
+    from rocksdict import Options, Rdict
+
+    from chia.full_node.db.rocks import RocksBackend
+
+    path = tmp_path / "chain.rocksdb"
+    options = Options(raw_mode=True)
+    options.create_if_missing(True)
+    options.create_missing_column_families(True)
+    default = Options(raw_mode=True)
+    parent = Options(raw_mode=True)
+    db = Rdict(
+        str(path),
+        options=options,
+        column_families={"default": default, "coins_by_parent": parent},
+    )
+    db.close()
+    chain = ChainDB(RocksBackend(path, sync="OFF"))
+    await chain.close()
+    assert "coins_by_parent" not in Rdict.list_cf(str(path))
+
+
+@pytest.mark.anyio
+async def test_reads_do_not_leave_a_write_ahead_file_each(tmp_path: Path) -> None:
+    from chia.full_node.db.rocks import RocksBackend
+
+    path = tmp_path / "chain.rocksdb"
+    chain = ChainDB(RocksBackend(path, sync="NORMAL"))
+    async with chain.writer() as session:
+        session.put("meta", b"k", b"v")
+    for _ in range(30):
+        async with chain.reader_no_transaction() as view:
+            assert await view.get("meta", b"k") == b"v"
+    wal_count = len(list(path.glob("*.log")))
+    await chain.close()
+    assert wal_count <= 4
+
+
+@pytest.mark.anyio
+async def test_old_diagnostic_logs_are_capped(tmp_path: Path) -> None:
+    from chia.full_node.db.rocks import RocksBackend
+
+    path = tmp_path / "chain.rocksdb"
+    chain = ChainDB(RocksBackend(path, sync="OFF"))
+    await chain.close()
+    for index in range(10):
+        (path / f"LOG.old.{index}").write_bytes(b"x" * 64)
+    chain = ChainDB(RocksBackend(path, sync="OFF"))
+    await chain.close()
+    assert len(list(path.glob("LOG.old.*"))) <= 7
+
+
+@pytest.mark.anyio
+async def test_commit_is_visible_to_a_later_reader(chain_db: ChainDB) -> None:
+    async with chain_db.writer() as session:
+        session.put("meta", b"a", b"1")
+    async with chain_db.reader_no_transaction() as view:
+        assert await view.get("meta", b"a") == b"1"
+
+
+@pytest.mark.anyio
+async def test_uncommitted_write_is_hidden_from_other_tasks(chain_db: ChainDB) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def writer() -> None:
+        async with chain_db.writer() as session:
+            session.put("meta", b"a", b"1")
+            started.set()
+            await release.wait()
+
+    task = create_referenced_task(writer())
+    await started.wait()
+    async with chain_db.reader_no_transaction() as view:
+        assert await view.get("meta", b"a") is None
+    release.set()
+    await task
+    async with chain_db.reader_no_transaction() as view:
+        assert await view.get("meta", b"a") == b"1"
+
+
+@pytest.mark.anyio
+async def test_same_task_reads_its_own_writes(chain_db: ChainDB) -> None:
+    async with chain_db.writer() as session:
+        session.put("coins", b"aa", b"one")
+        async with chain_db.reader_no_transaction() as view:
+            assert await view.get("coins", b"aa") == b"one"
+        async with chain_db.writer_maybe_transaction() as joined:
+            joined.put("coins", b"bb", b"two")
+            assert await joined.get("coins", b"bb") == b"two"
+
+
+@pytest.mark.anyio
+async def test_nested_savepoint_rolls_back_without_losing_the_outer_put(chain_db: ChainDB) -> None:
+    async with chain_db.writer() as session:
+        session.put("meta", b"keep", b"yes")
+        try:
+            async with chain_db.writer() as inner:
+                inner.put("meta", b"drop", b"no")
+                raise RuntimeError("inner")
+        except RuntimeError:
+            assert await session.get("meta", b"drop") is None
+            assert await session.get("meta", b"keep") == b"yes"
+    async with chain_db.reader_no_transaction() as view:
+        assert await view.get("meta", b"keep") == b"yes"
+        assert await view.get("meta", b"drop") is None
+
+
+@pytest.mark.anyio
+async def test_outer_exception_discards_the_batch(chain_db: ChainDB) -> None:
+    with pytest.raises(RuntimeError):
+        async with chain_db.writer() as session:
+            session.put("meta", b"a", b"1")
+            raise RuntimeError("fail")
+    async with chain_db.reader_no_transaction() as view:
+        assert await view.get("meta", b"a") is None
+
+
+@pytest.mark.anyio
+async def test_delete_range_then_put_is_visible_in_scan(chain_db: ChainDB) -> None:
+    async with chain_db.writer() as session:
+        session.put("coins", b"\x01a", b"old")
+        session.put("coins", b"\x01b", b"old")
+        session.put("coins", b"\x02c", b"stay")
+    async with chain_db.writer() as session:
+        session.delete_range("coins", b"\x01", b"\x02")
+        session.put("coins", b"\x01z", b"new")
+        rows = await session.scan("coins", b"", None)
+    assert rows == [(b"\x01z", b"new"), (b"\x02c", b"stay")]
+
+
+@pytest.mark.anyio
+async def test_an_unfinished_copy_is_refused_and_a_finished_folder_is_not(tmp_path: Path) -> None:
+    from chia.full_node.db.keys import CF_META, META_COMPLETE, META_MIGRATE_PHASE, META_MIGRATE_SOURCE
+    from chia.full_node.db.rocks import RocksBackend
+    from chia.full_node.db.startup import migration_block_reason, unfinished_migration_reason
+
+    unfinished = tmp_path / "partial.rocksdb"
+    chain = ChainDB(RocksBackend(unfinished, sync="OFF"))
+    async with chain.writer() as session:
+        session.put(CF_META, META_MIGRATE_PHASE, b"coins")
+        session.put(CF_META, META_MIGRATE_SOURCE, b"D:/old/blockchain_v2_mainnet.sqlite")
+    reason = await migration_block_reason(chain, unfinished)
+    await chain.close()
+    assert reason is not None
+    assert "chia db migrate" not in reason
+    assert "D:/old/blockchain_v2_mainnet.sqlite" in reason
+    assert "new folder" in reason
+    assert await unfinished_migration_reason(unfinished) == reason
+    from chia.full_node.db.validate import backup_rocks
+
+    with pytest.raises(RuntimeError, match="unfinished copy"):
+        await backup_rocks(unfinished, tmp_path / "unfinished-backup.rocksdb")
+
+    finished = tmp_path / "live.rocksdb"
+    live = ChainDB(RocksBackend(finished, sync="OFF"))
+    async with live.writer() as session:
+        session.put(CF_META, META_COMPLETE, b"1")
+    assert await migration_block_reason(live, finished) is None
+    await live.close()
+    assert await unfinished_migration_reason(finished) is None
+
+
+def test_existing_sqlite_file_stays_sqlite(tmp_path: Path) -> None:
+    db = tmp_path / "db"
+    db.mkdir()
+    sqlite_file = db / "blockchain_v3_mainnet.sqlite"
+    sqlite_file.write_bytes(b"")
+    choice = choose_full_node_database(tmp_path, f"db/blockchain_v3_CHALLENGE{SQLITE_SUFFIX}", "mainnet")
+    assert choice.engine == "sqlite"
+    assert choice.path == sqlite_file.resolve()
+    assert choice.config_database_path is None
+
+
+def test_missing_sqlite_with_no_siblings_rewrites_to_rocksdb(tmp_path: Path) -> None:
+    choice = choose_full_node_database(tmp_path, f"db/blockchain_v3_CHALLENGE{SQLITE_SUFFIX}", "mainnet")
+    assert choice.engine == "rocksdb"
+    assert choice.path.name == f"blockchain_v3_mainnet{ROCKS_SUFFIX}"
+    assert choice.config_database_path == f"db/blockchain_v3_CHALLENGE{ROCKS_SUFFIX}"
+
+
+def test_missing_network_sqlite_does_not_redirect_other_networks(tmp_path: Path) -> None:
+    db = tmp_path / "db"
+    db.mkdir()
+    (db / "blockchain_v3_mainnet.sqlite").write_bytes(b"")
+    choice = choose_full_node_database(tmp_path, f"db/blockchain_v3_CHALLENGE{SQLITE_SUFFIX}", "testnet11")
+    assert choice.engine == "rocksdb"
+    assert choice.path.name == f"blockchain_v3_testnet11{ROCKS_SUFFIX}"
+    assert choice.config_database_path is None
+
+
+def test_rocksdb_suffix_is_used_even_when_the_directory_is_absent(tmp_path: Path) -> None:
+    choice = choose_full_node_database(tmp_path, f"db/blockchain_v3_CHALLENGE{ROCKS_SUFFIX}", "mainnet")
+    assert choice.engine == "rocksdb"
+    assert choice.path.name == f"blockchain_v3_mainnet{ROCKS_SUFFIX}"
+    assert not choice.path.exists()
+
+
+def test_unknown_suffix_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="must end in"):
+        choose_full_node_database(tmp_path, "db/blockchain_v3_CHALLENGE.db", "mainnet")
+
+
+def test_older_full_record_database_is_refused() -> None:
+    assert needs_silo_format(None) is True
+    assert needs_silo_format(META_FORMAT_VALUE) is False
+    with pytest.raises(RuntimeError, match=r"config\.yaml"):
+        needs_silo_format(b"rocksdb-v1")
+
+
+def test_config_directory_is_the_directory_that_is_opened(tmp_path: Path) -> None:
+    chosen = tmp_path / "user-picked" / "blockchain_v3_mainnet.rocksdb"
+    choice = choose_full_node_database(Path("C:/not-this-root"), str(chosen), "mainnet")
+    assert choice.engine == "rocksdb"
+    assert choice.path == chosen.resolve()
+    assert not choice.path.exists()

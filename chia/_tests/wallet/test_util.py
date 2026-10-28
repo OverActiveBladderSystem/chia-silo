@@ -1,0 +1,269 @@
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+from chia_rs.sized_bytes import bytes32, bytes48
+from chia_rs.sized_ints import uint64
+
+from chia._tests.util.misc import CoinGenerator, coin_creation_args
+from chia.consensus.default_constants import DEFAULT_CONSTANTS
+from chia.types.blockchain_format.coin import Coin
+from chia.types.blockchain_format.program import Program
+from chia.types.coin_spend import make_spend
+from chia.util.errors import ValidationError
+from chia.wallet.lineage_proof import LineageProof, LineageProofField
+from chia.wallet.util.compute_hints import HintedCoin, compute_spend_hints_and_additions
+from chia.wallet.util.merkle_utils import list_to_binary_tree
+from chia.wallet.util.tx_config import (
+    DEFAULT_COIN_SELECTION_CONFIG,
+    DEFAULT_TX_CONFIG,
+    CoinSelectionConfigLoader,
+    TXConfigLoader,
+)
+from chia.wallet.util.wallet_types import WalletType
+
+
+def test_compute_spend_hints_and_additions() -> None:
+    coin_generator = CoinGenerator()
+    parent_coin = coin_generator.get()
+    hinted_coins = [coin_generator.get(parent_coin.coin.name(), include_hint=i % 2 == 0) for i in range(10)]
+    create_coin_args = [coin_creation_args(create_coin) for create_coin in hinted_coins]
+    coin_spend = make_spend(
+        parent_coin.coin,
+        Program.to(1),
+        Program.to(create_coin_args),
+    )
+    expected_dict = {hinted_coin.coin.name(): hinted_coin for hinted_coin in hinted_coins}
+    assert compute_spend_hints_and_additions(coin_spend)[0] == expected_dict
+
+    not_hinted_coin = HintedCoin(Coin(parent_coin.coin.name(), bytes32.zeros, uint64(0)), None)
+    assert compute_spend_hints_and_additions(
+        make_spend(parent_coin.coin, Program.to(1), Program.to([[51, bytes32.zeros, 0, [["not", "a"], "hint"]]]))
+    )[0] == {not_hinted_coin.coin.name(): not_hinted_coin}
+
+    with pytest.raises(ValidationError):
+        compute_spend_hints_and_additions(
+            make_spend(parent_coin.coin, Program.to(1), Program.to([[51, bytes32.zeros, 0] for _ in range(10000)]))
+        )
+    with pytest.raises(ValidationError):
+        compute_spend_hints_and_additions(
+            make_spend(parent_coin.coin, Program.to(1), Program.to([[50, bytes48.zeros, b""] for _ in range(10000)]))
+        )
+
+
+def test_offer_rejects_spend_exceeding_max_cost() -> None:
+    from chia_rs import G2Element
+
+    from chia.wallet.trading.offer import Offer
+    from chia.wallet.wallet_spend_bundle import WalletSpendBundle
+
+    coin_generator = CoinGenerator()
+    parent_coin = coin_generator.get()
+    expensive_spend = make_spend(
+        parent_coin.coin,
+        Program.to(1),
+        Program.to([[51, bytes32.zeros, 0] for _ in range(10000)]),
+    )
+    with pytest.raises(ValidationError):
+        Offer({}, WalletSpendBundle([expensive_spend], G2Element()), {})
+
+
+def test_offer_enforces_remaining_max_cost_across_spends() -> None:
+    """Two spends each under the full block cost, but over when summed.
+
+    With max_cost= remaining passed through, the second spend fails inside
+    compute_spend_hints_and_additions. Without it, both succeed and Offer only
+    fails afterward on the residual max_cost < 0 check.
+    """
+    from chia_rs import G2Element
+
+    from chia.wallet.trading.offer import Offer
+    from chia.wallet.wallet_spend_bundle import WalletSpendBundle
+
+    coin_generator = CoinGenerator()
+    # ~6.3e9 each; MAX_BLOCK_COST_CLVM is 11e9, so one fits and two do not.
+    spends = [
+        make_spend(
+            coin_generator.get().coin,
+            Program.to(1),
+            Program.to([[51, bytes32.zeros, 1] for _ in range(3500)]),
+        )
+        for _ in range(2)
+    ]
+    with pytest.raises(ValidationError, match="compute_spend_hints_and_additions"):
+        Offer({}, WalletSpendBundle(spends, G2Element()), {})
+
+
+def test_offer_maps_clvm_cost_exceeded_value_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """After prior spends leave almost no CLVM budget, run_with_cost raises ValueError.
+
+    Offer remaps that to ValidationError. Lower MAX_BLOCK_COST_CLVM so a cheap
+    first spend can deplete the budget without needing huge CREATE_COIN lists.
+    """
+    from chia_rs import G2Element
+    from chia_rs.sized_ints import uint64
+
+    import chia.wallet.trading.offer as offer_mod
+    from chia.wallet.trading.offer import Offer
+    from chia.wallet.wallet_spend_bundle import WalletSpendBundle
+
+    coin_generator = CoinGenerator()
+    # Minimal first spend (~44 cost). Leave only 10 for the second so CLVM aborts
+    # inside run_with_cost with ValueError("cost exceeded or below zero").
+    first = make_spend(coin_generator.get().coin, Program.to(1), Program.to([]))
+    _, first_cost = compute_spend_hints_and_additions(first)
+    second = make_spend(
+        coin_generator.get().coin,
+        Program.to(1),
+        Program.to([[51, bytes32.zeros, 1]]),
+    )
+    monkeypatch.setattr(
+        offer_mod,
+        "DEFAULT_CONSTANTS",
+        DEFAULT_CONSTANTS.replace(MAX_BLOCK_COST_CLVM=uint64(first_cost + 10)),
+    )
+    with pytest.raises(ValidationError, match="compute_additions for CoinSpend"):
+        Offer({}, WalletSpendBundle([first, second], G2Element()), {})
+
+
+def test_cs_config() -> None:
+    default_cs_config = DEFAULT_COIN_SELECTION_CONFIG.to_json_dict()
+    assert (
+        CoinSelectionConfigLoader.from_json_dict({}).autofill(constants=DEFAULT_CONSTANTS).to_json_dict()
+        == default_cs_config
+    )
+    assert DEFAULT_COIN_SELECTION_CONFIG.override(min_coin_amount=50).to_json_dict() == {
+        **default_cs_config,
+        "min_coin_amount": 50,
+    }
+    coin_to_exclude = CoinGenerator().get().coin
+    coin_id_to_exclude = bytes32.zeros
+    assert CoinSelectionConfigLoader.from_json_dict(
+        {
+            "excluded_coins": [coin_to_exclude.to_json_dict()],
+            "excluded_coin_ids": [coin_id_to_exclude.hex()],
+        }
+    ).autofill(constants=DEFAULT_CONSTANTS).to_json_dict() == {
+        **default_cs_config,
+        "excluded_coin_ids": ["0x" + coin_to_exclude.name().hex(), "0x" + coin_id_to_exclude.hex()],
+    }
+    assert CoinSelectionConfigLoader.from_json_dict(
+        {
+            "excluded_coins": [coin_to_exclude.to_json_dict()],
+        }
+    ).override(max_coin_amount=100).autofill(constants=DEFAULT_CONSTANTS).to_json_dict() == {
+        **default_cs_config,
+        "excluded_coin_ids": ["0x" + coin_to_exclude.name().hex()],
+        "max_coin_amount": 100,
+    }
+    with pytest.raises(ValueError, match="`included_coin_ids` and `excluded_coin_ids` must be disjoint"):
+        CoinSelectionConfigLoader(excluded_coin_ids=[bytes32.zeros], included_coin_ids=[bytes32.zeros]).autofill(
+            constants=DEFAULT_CONSTANTS
+        )
+    with pytest.raises(ValueError, match="Some coin selection restrictions eliminated coins specified for inclusion"):
+        a_coin = Coin(bytes32.zeros, bytes32.zeros, uint64(0))
+        CoinSelectionConfigLoader(included_coin_ids=[a_coin.name()], excluded_coin_amounts=[uint64(0)]).autofill(
+            constants=DEFAULT_CONSTANTS
+        ).filter_coins({a_coin})
+
+
+def test_tx_config() -> None:
+    default_tx_config = DEFAULT_TX_CONFIG.to_json_dict()
+    assert TXConfigLoader.from_json_dict({}).autofill(constants=DEFAULT_CONSTANTS).to_json_dict() == default_tx_config
+    assert DEFAULT_TX_CONFIG.override(reuse_puzhash=True).to_json_dict() == {**default_tx_config, "reuse_puzhash": True}
+    assert TXConfigLoader.from_json_dict({}).autofill(
+        constants=DEFAULT_CONSTANTS, config={"reuse_public_key_for_change": {"1": True}}, logged_in_fingerprint=1
+    ).to_json_dict() == {**default_tx_config, "reuse_puzhash": True}
+
+
+def test_list_to_binary_tree() -> None:
+    assert list_to_binary_tree([1]) == 1
+    assert list_to_binary_tree([1, 2]) == (1, 2)
+    assert list_to_binary_tree([1, 2, 3]) == ((1, 2), 3)
+    assert list_to_binary_tree([1, 2, 3, 4]) == ((1, 2), (3, 4))
+    assert list_to_binary_tree([1, 2, 3, 4, 5]) == (((1, 2), 3), (4, 5))
+    with pytest.raises(ValueError):
+        list_to_binary_tree([])
+
+
+@pytest.mark.parametrize(
+    "serializations",
+    [
+        (tuple(), Program.NIL, []),
+        ((bytes32.zeros,), Program.to([bytes32.zeros]), [LineageProofField.PARENT_NAME]),
+        (
+            (bytes32.zeros, bytes32.zeros),
+            Program.to([bytes32.zeros, bytes32.zeros]),
+            [LineageProofField.PARENT_NAME, LineageProofField.INNER_PUZZLE_HASH],
+        ),
+        (
+            (bytes32.zeros, bytes32.zeros, uint64(0)),
+            Program.to([bytes32.zeros, bytes32.zeros, uint64(0)]),
+            [LineageProofField.PARENT_NAME, LineageProofField.INNER_PUZZLE_HASH, LineageProofField.AMOUNT],
+        ),
+    ],
+)
+def test_lineage_proof_varargs(serializations: tuple[tuple[Any, ...], Program, list[LineageProofField]]) -> None:
+    var_args, expected_program, lp_fields = serializations
+    assert LineageProof(*var_args).to_program() == expected_program
+    assert LineageProof(*var_args) == LineageProof.from_program(expected_program, lp_fields)
+
+
+@pytest.mark.parametrize(
+    "serializations",
+    [
+        ({}, Program.NIL, []),
+        ({"parent_name": bytes32.zeros}, Program.to([bytes32.zeros]), [LineageProofField.PARENT_NAME]),
+        (
+            {"parent_name": bytes32.zeros, "inner_puzzle_hash": bytes32.zeros},
+            Program.to([bytes32.zeros, bytes32.zeros]),
+            [LineageProofField.PARENT_NAME, LineageProofField.INNER_PUZZLE_HASH],
+        ),
+        (
+            {"parent_name": bytes32.zeros, "inner_puzzle_hash": bytes32.zeros, "amount": uint64(0)},
+            Program.to([bytes32.zeros, bytes32.zeros, uint64(0)]),
+            [LineageProofField.PARENT_NAME, LineageProofField.INNER_PUZZLE_HASH, LineageProofField.AMOUNT],
+        ),
+        (
+            {"parent_name": bytes32.zeros, "amount": uint64(0)},
+            Program.to([bytes32.zeros, uint64(0)]),
+            [LineageProofField.PARENT_NAME, LineageProofField.AMOUNT],
+        ),
+        (
+            {"inner_puzzle_hash": bytes32.zeros, "amount": uint64(0)},
+            Program.to([bytes32.zeros, uint64(0)]),
+            [LineageProofField.INNER_PUZZLE_HASH, LineageProofField.AMOUNT],
+        ),
+        ({"amount": uint64(0)}, Program.to([uint64(0)]), [LineageProofField.AMOUNT]),
+        (
+            {"inner_puzzle_hash": bytes32.zeros},
+            Program.to([bytes32.zeros]),
+            [LineageProofField.INNER_PUZZLE_HASH],
+        ),
+    ],
+)
+def test_lineage_proof_kwargs(serializations: tuple[dict[str, Any], Program, list[LineageProofField]]) -> None:
+    kwargs, expected_program, lp_fields = serializations
+    assert LineageProof(**kwargs).to_program() == expected_program
+    assert LineageProof(**kwargs) == LineageProof.from_program(expected_program, lp_fields)
+
+
+def test_lineage_proof_errors() -> None:
+    with pytest.raises(ValueError, match="Mismatch"):
+        LineageProof.from_program(Program.to([]), [LineageProofField.PARENT_NAME])
+    with pytest.raises(StopIteration):
+        LineageProof.from_program(Program.to([bytes32.zeros]), [])
+    with pytest.raises(ValueError):
+        LineageProof.from_program(Program.to([bytes32([1] * 32)]), [LineageProofField.AMOUNT])
+    with pytest.raises(ValueError):
+        LineageProof.from_program(Program.to([uint64(0)]), [LineageProofField.PARENT_NAME])
+
+
+# this is the only test that has coverage for `WalletType.to_json_dict`
+# it's possible it could even be deleted
+
+
+def test_wallet_type_to_json() -> None:
+    for w in WalletType:
+        assert w.to_json_dict() == w.name

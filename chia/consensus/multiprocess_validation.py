@@ -1,0 +1,613 @@
+from __future__ import annotations
+
+import asyncio
+import copy
+import logging
+import threading
+import time
+import traceback
+from collections import OrderedDict
+from collections.abc import Awaitable, Collection, Mapping, Sequence
+from concurrent.futures import Future
+from dataclasses import dataclass
+from typing import Any
+
+from chia_rs import (
+    BlockRecord,
+    ConsensusConstants,
+    FullBlock,
+    SpendBundleConditions,
+    SubEpochSummary,
+    get_flags_for_height_and_constants,
+    is_canonical_serialization,
+    run_block_generator,
+    run_block_generator2,
+)
+from chia_rs.sized_bytes import bytes32
+from chia_rs.sized_ints import uint16, uint32, uint64
+
+from chia.consensus.augmented_chain import AugmentedBlockchain
+from chia.consensus.block_generator_info import (
+    block_has_transactions_generator,
+    get_transactions_generator_bytes,
+)
+from chia.consensus.block_header_validation import validate_finished_header_block
+from chia.consensus.blockchain_interface import BlockRecordsProtocol
+from chia.consensus.difficulty_adjustment import get_next_sub_slot_iters_and_difficulty
+from chia.consensus.full_block_to_block_record import block_to_block_record
+from chia.consensus.generator_tools import get_block_header, tx_removals_and_additions
+from chia.consensus.generator_validation import validate_generator_ref_list
+from chia.consensus.get_block_challenge import (
+    get_block_challenge,
+    get_filter_challenge_from_chain,
+    pre_sp_tx_block_height,
+)
+from chia.consensus.get_block_generator import get_block_generator
+from chia.consensus.pot_iterations import (
+    is_overflow_block,
+    validate_pospace_and_get_required_iters,
+)
+from chia.types.blockchain_format.classgroup import ClassgroupElement
+from chia.types.blockchain_format.coin import Coin
+from chia.types.blockchain_format.vdf import validate_vdf
+from chia.types.generator_types import BlockGenerator
+from chia.types.validation_state import ValidationState
+from chia.util.errors import Err
+from chia.util.hash import std_hash
+from chia.util.priority_thread_pool_executor import Executor, _SupportsLessThan
+from chia.util.streamable import Streamable, streamable
+
+log = logging.getLogger(__name__)
+
+
+@streamable
+@dataclass(frozen=True)
+class PreValidationResult(Streamable):
+    error: uint16 | None
+    error_msg: str | None
+    required_iters: uint64 | None  # Iff error is None
+    conds: SpendBundleConditions | None  # Iff error is None and block is a transaction block
+    timing: uint32  # the time (in milliseconds) it took to pre-validate the block
+
+    @property
+    def validated_signature(self) -> bool:
+        if self.conds is None:
+            return False
+        return self.conds.validated_signature
+
+
+# this layer of abstraction is here to let wallet tests monkeypatch it
+def _run_block(
+    block: FullBlock, prev_generators: list[bytes], prev_tx_height: uint32, constants: ConsensusConstants
+) -> tuple[Err | None, str | None, SpendBundleConditions | None]:
+    generator_bytes = get_transactions_generator_bytes(block)
+    assert generator_bytes is not None
+    assert block.transactions_info is not None
+    flags = get_flags_for_height_and_constants(prev_tx_height, constants)
+    if block.height >= constants.HARD_FORK_HEIGHT:
+        run_block = run_block_generator2
+    else:
+        run_block = run_block_generator
+    error, error_msg, conds = run_block(
+        generator_bytes,
+        prev_generators,
+        block.transactions_info.cost,
+        flags,
+        block.transactions_info.aggregated_signature,
+        None,
+        constants,
+    )
+    return None if error is None else Err(error), error_msg, conds
+
+
+# Programs run before their block is linked. Reused only when the real check
+# selects the same rule flags and the same older program bytes.
+_PROGRAM_CACHE_LIMIT = 256
+_program_cache_lock = threading.Lock()
+_program_cache: OrderedDict[bytes32, tuple[int, bytes32, SpendBundleConditions | None, Err | None, str | None]] = (
+    OrderedDict()
+)
+
+
+def program_refs_digest(prev_generators: list[bytes]) -> bytes32:
+    """Identity of the older programs a cached run used."""
+    parts = [len(prev_generators).to_bytes(4, "big")]
+    for program in prev_generators:
+        parts.append(len(program).to_bytes(4, "big"))
+        parts.append(program)
+    return std_hash(b"".join(parts))
+
+
+def earlier_programs_for_block(block: FullBlock, generators: Mapping[int, bytes]) -> list[bytes] | None:
+    """Older program bytes this block names, in list order.
+
+    None when any named height is missing from ``generators``. An empty list
+    means the program does not name an older one.
+    """
+    programs: list[bytes] = []
+    for height in block.transactions_generator_ref_list:
+        program = generators.get(int(height))
+        if program is None:
+            return None
+        programs.append(program)
+    return programs
+
+
+def program_can_be_precomputed(block: FullBlock, generators: Mapping[int, bytes] | None = None) -> bool:
+    """True when this block's transaction program can run before the chain links it.
+
+    A non-transaction block and a reward-only transaction block have no program.
+    Their proof math is a separate job and does not use this function. A program
+    that names older programs can run once those bytes are already in ``generators``.
+    """
+    if not block_has_transactions_generator(block):
+        return False
+    if block.transactions_info is None or block.foliage_transaction_block is None:
+        return False
+    if generators is None:
+        return len(block.transactions_generator_ref_list) == 0
+    return earlier_programs_for_block(block, generators) is not None
+
+
+# These failures describe the body bytes, which the header hash does not cover.
+# Saving them under the header hash makes the next honest copy of that block fail.
+_UNCACHEABLE_PROGRAM_ERRORS = frozenset(
+    {
+        Err.INVALID_TRANSACTIONS_GENERATOR_HASH,
+        Err.INVALID_TRANSACTIONS_INFO_HASH,
+        Err.INVALID_FOLIAGE_BLOCK_HASH,
+    }
+)
+
+
+def remember_precomputed_program(
+    header_hash: bytes32,
+    flags: int,
+    refs_digest: bytes32,
+    conds: SpendBundleConditions | None,
+    err: Err | None,
+    err_msg: str | None,
+) -> None:
+    if err in _UNCACHEABLE_PROGRAM_ERRORS:
+        return
+    with _program_cache_lock:
+        _program_cache[header_hash] = (flags, refs_digest, conds, err, err_msg)
+        _program_cache.move_to_end(header_hash)
+        while len(_program_cache) > _PROGRAM_CACHE_LIMIT:
+            _program_cache.popitem(last=False)
+
+
+def take_precomputed_program(
+    header_hash: bytes32,
+    flags: int,
+    prev_generators: list[bytes],
+) -> tuple[Err | None, str | None, SpendBundleConditions | None] | None:
+    """Return a saved program result when the rules and older programs match.
+
+    A result from a different rule set, or from different older programs, is
+    dropped. The block is then run normally.
+    """
+    digest = program_refs_digest(prev_generators)
+    with _program_cache_lock:
+        cached = _program_cache.pop(header_hash, None)
+    if cached is None or cached[0] != flags or cached[1] != digest or cached[3] in _UNCACHEABLE_PROGRAM_ERRORS:
+        return None
+    return cached[3], cached[4], cached[2]
+
+
+def precompute_block_proofs(constants: ConsensusConstants, block: FullBlock) -> None:
+    """Run the proof math that is already written inside this block.
+
+    Reward-chain proofs, and challenge-chain proofs that start from the
+    identity, carry their own challenge and iteration count. The later check
+    still decides whether that proof belongs on the previous block. Running
+    the math now leaves the answer ready for that check.
+    """
+    try:
+        identity = ClassgroupElement.get_default_element()
+        reward = block.reward_chain_block
+        validate_vdf(block.reward_chain_ip_proof, constants, identity, reward.reward_chain_ip_vdf)
+        if block.reward_chain_sp_proof is not None and reward.reward_chain_sp_vdf is not None:
+            validate_vdf(block.reward_chain_sp_proof, constants, identity, reward.reward_chain_sp_vdf)
+        if block.challenge_chain_ip_proof.normalized_to_identity:
+            validate_vdf(block.challenge_chain_ip_proof, constants, identity, reward.challenge_chain_ip_vdf)
+        signage_proof = block.challenge_chain_sp_proof
+        if (
+            signage_proof is not None
+            and signage_proof.normalized_to_identity
+            and reward.challenge_chain_sp_vdf is not None
+        ):
+            validate_vdf(signage_proof, constants, identity, reward.challenge_chain_sp_vdf)
+        for sub_slot in block.finished_sub_slots:
+            validate_vdf(
+                sub_slot.proofs.reward_chain_slot_proof,
+                constants,
+                identity,
+                sub_slot.reward_chain.end_of_slot_vdf,
+            )
+            slot_proof = sub_slot.proofs.challenge_chain_slot_proof
+            if slot_proof.normalized_to_identity:
+                validate_vdf(
+                    slot_proof,
+                    constants,
+                    identity,
+                    sub_slot.challenge_chain.challenge_chain_end_of_slot_vdf,
+                )
+            infused = sub_slot.infused_challenge_chain
+            infused_proof = sub_slot.proofs.infused_challenge_chain_slot_proof
+            if infused is not None and infused_proof is not None and infused_proof.normalized_to_identity:
+                validate_vdf(
+                    infused_proof,
+                    constants,
+                    identity,
+                    infused.infused_challenge_chain_end_of_slot_vdf,
+                )
+    except Exception:
+        log.exception("precompute block proofs failed")
+
+
+def precompute_transaction_program(
+    constants: ConsensusConstants, block: FullBlock, prev_generators: list[bytes]
+) -> None:
+    """Run one transaction program on a background worker.
+
+    ``block.height`` supplies the rule flags. The later check repeats the run
+    when the real previous-transaction height selects different flags, or when
+    the chain's older programs are not these bytes.
+    """
+    if not block_has_transactions_generator(block):
+        return
+    if block.transactions_info is None or block.foliage_transaction_block is None:
+        return
+    generator_bytes = get_transactions_generator_bytes(block)
+    if generator_bytes is None:
+        return
+    flags = int(get_flags_for_height_and_constants(uint32(block.height), constants))
+    err: Err | None
+    err_msg: str | None
+    conds: SpendBundleConditions | None
+    if std_hash(generator_bytes) != block.transactions_info.generator_root:
+        err, err_msg, conds = Err.INVALID_TRANSACTIONS_GENERATOR_HASH, None, None
+    elif block.foliage_transaction_block.transactions_info_hash != block.transactions_info.get_hash():
+        err, err_msg, conds = Err.INVALID_TRANSACTIONS_INFO_HASH, None, None
+    elif block.foliage.foliage_transaction_block_hash != block.foliage_transaction_block.get_hash():
+        err, err_msg, conds = Err.INVALID_FOLIAGE_BLOCK_HASH, None, None
+    elif block.transactions_info.cost > constants.MAX_BLOCK_COST_CLVM:
+        err, err_msg, conds = Err.BLOCK_COST_EXCEEDS_MAX, None, None
+    else:
+        try:
+            err, err_msg, conds = _run_block(block, prev_generators, uint32(block.height), constants)
+        except Exception:
+            log.exception("precompute transaction program failed")
+            return
+        if err is None and (conds is None or conds.validated_signature is not True):
+            return
+    remember_precomputed_program(block.header_hash, flags, program_refs_digest(prev_generators), conds, err, err_msg)
+
+
+async def _await_block_math(
+    math_futures: Sequence[Future[Any]],
+    phase_times: dict[str, float] | None,
+    height: int,
+) -> None:
+    """Wait for this block's math on the event loop.
+
+    Records whether every job had already finished. A pool worker must not be
+    the one waiting: if every worker waited on another job, the pool would stall.
+    """
+    ready = all(earlier.done() for earlier in math_futures)
+    started = time.monotonic()
+    for earlier in math_futures:
+        try:
+            await asyncio.wrap_future(earlier)
+        except Exception:
+            log.exception("block math failed at height %s", height)
+    if phase_times is not None:
+        phase_times["math_wait"] = time.monotonic() - started
+        phase_times["math_queued"] = 1.0
+        if ready:
+            phase_times["math_ready"] = 1.0
+
+
+def _pre_validate_block(
+    constants: ConsensusConstants,
+    blockchain: BlockRecordsProtocol,
+    block: FullBlock,
+    prev_generators: list[bytes] | None,
+    conds: SpendBundleConditions | None,
+    prev_tx_height: uint32,
+    expected_vs: ValidationState,
+    *,
+    skip_commitment_validation: bool = False,
+    phase_times: dict[str, float] | None = None,
+) -> PreValidationResult:
+    """
+    Args:
+        constants:
+        blockchain:
+        block:
+        prev_generators:
+        conds:
+        prev_tx_height:
+        expected_vs: The validation state that we calculate for the next block
+            if it's validated.
+        skip_commitment_validation: If True, skips validation of MMR roots (for weight proofs without full history).
+            Challenge merkle tree validation is gated by HARD_FORK2_HEIGHT, not this flag.
+    """
+
+    validation_start = time.monotonic()
+
+    def error_result(error: Err, error_msg: str | None = None) -> PreValidationResult:
+        validation_time = time.monotonic() - validation_start
+        return PreValidationResult(uint16(error.value), error_msg, None, None, uint32(validation_time * 1000))
+
+    try:
+        removals_and_additions: tuple[Collection[bytes32], Collection[Coin]] | None = None
+        clvm_run = 0.0
+        if conds is not None:
+            assert conds.validated_signature is True
+            assert block_has_transactions_generator(block)
+            removals_and_additions = tx_removals_and_additions(conds)
+        elif block_has_transactions_generator(block):
+            assert prev_generators is not None
+            assert block.transactions_info is not None
+
+            if block.transactions_info.cost > constants.MAX_BLOCK_COST_CLVM:
+                return error_result(Err.BLOCK_COST_EXCEEDS_MAX)
+
+            if block.foliage_transaction_block is None:
+                return error_result(Err.INVALID_TRANSACTIONS_INFO_HASH)
+
+            # Fast-fail: prove the generator is the committed one before
+            # executing it. A peer can keep all farmed/signed header fields
+            # intact and swap only transactions_generator; these cheap hash
+            # checks reject that before the expensive CLVM run.
+            generator_bytes = get_transactions_generator_bytes(block)
+            assert generator_bytes is not None
+            if std_hash(generator_bytes) != block.transactions_info.generator_root:
+                return error_result(Err.INVALID_TRANSACTIONS_GENERATOR_HASH)
+            if block.foliage_transaction_block.transactions_info_hash != block.transactions_info.get_hash():
+                return error_result(Err.INVALID_TRANSACTIONS_INFO_HASH)
+            if block.foliage.foliage_transaction_block_hash != block.foliage_transaction_block.get_hash():
+                return error_result(Err.INVALID_FOLIAGE_BLOCK_HASH)
+
+            if prev_tx_height >= constants.SOFT_FORK9_HEIGHT:
+                if not is_canonical_serialization(generator_bytes):
+                    return error_result(Err.INVALID_TRANSACTIONS_GENERATOR_ENCODING)
+
+            flags = int(get_flags_for_height_and_constants(prev_tx_height, constants))
+            cached = take_precomputed_program(block.header_hash, flags, prev_generators)
+            if cached is not None:
+                err, err_msg, conds = cached
+                clvm_run = 0.0
+                if phase_times is not None:
+                    phase_times["precomputed"] = 1.0
+            else:
+                clvm_started = time.monotonic()
+                err, err_msg, conds = _run_block(block, prev_generators, prev_tx_height, constants)
+                clvm_run = time.monotonic() - clvm_started
+
+            assert (err is None) != (conds is None)
+            if err is not None:
+                return error_result(err, err_msg)
+            assert conds is not None
+            assert conds.validated_signature is True
+            removals_and_additions = tx_removals_and_additions(conds)
+        elif block.is_transaction_block():
+            # This is a transaction block with just reward coins.
+            removals_and_additions = ([], [])
+
+        assert conds is None or conds.validated_signature is True
+        header_started = time.monotonic()
+        required_iters, error = validate_finished_header_block(
+            constants,
+            blockchain,
+            get_block_header(block, removals_and_additions),
+            True,  # check_filter
+            expected_vs,
+            skip_commitment_validation=skip_commitment_validation,
+        )
+        error_int = None if error is None else uint16(error.code.value)
+        if phase_times is not None:
+            phase_times["clvm_run"] = clvm_run
+            phase_times["header"] = time.monotonic() - header_started
+
+        validation_time = time.monotonic() - validation_start
+        return PreValidationResult(
+            error_int,
+            None,
+            required_iters,
+            conds,
+            uint32(validation_time * 1000),
+        )
+    except Exception:
+        error_stack = traceback.format_exc()
+        log.error(f"Exception: {error_stack}")
+        return error_result(Err.UNKNOWN)
+
+
+async def pre_validate_block(
+    constants: ConsensusConstants,
+    blockchain: AugmentedBlockchain,
+    block: FullBlock,
+    pool: Executor,
+    conds: SpendBundleConditions | None,
+    vs: ValidationState,
+    *,
+    wp_summaries: list[SubEpochSummary] | None = None,
+    skip_commitment_validation: bool = False,
+    nice: _SupportsLessThan = (0,),
+    dedicated: bool = True,
+    phase_times: dict[str, float] | None = None,
+    math_futures: Sequence[Future[Any]] | None = None,
+) -> Awaitable[PreValidationResult]:
+    """
+    This method must be called under the blockchain lock
+    The block passed to this function is submitted to be validated in the
+    executor passed in as "pool". The future for the job is then returned.
+    When awaited, the return value is the PreValidationResult for the block.
+    The PreValidationResult indicates whether the block was valid or not.
+
+    Args:
+        constants:
+        blockchain: The blockchain object to validate these blocks with respect to.
+            It's an AugmentedBlockchain to allow for previous batches of blocks to
+            be included, even if they haven't been added to the underlying blockchain
+            database yet. The blocks passed in will be added/augmented onto this blockchain.
+        pool: The executor to submit the validation jobs to
+        block: The full block to validate (must be connected to current chain)
+        conds: The SpendBundleConditions for transaction blocks, if we have one.
+            This will be computed if None is passed.
+        vs: The ValidationState refers to the state for the block.
+            This is an in-out parameter that will be updated to the validation state
+            for the next block. It includes subslot iterators, difficulty and
+            the previous sub epoch summary (ses) block.
+        wp_summaries:
+        validate_signatures:
+    """
+    prev_b: BlockRecord | None = None
+
+    async def return_error(error_code: Err) -> PreValidationResult:
+        return PreValidationResult(uint16(error_code.value), None, None, None, uint32(0))
+
+    if block.height == 0:
+        if block.prev_header_hash != constants.GENESIS_CHALLENGE:
+            return return_error(Err.INVALID_PREV_BLOCK_HASH)
+    else:
+        curr = blockchain.try_block_record(block.prev_header_hash)
+        if curr is None:
+            return return_error(Err.INVALID_PREV_BLOCK_HASH)
+        prev_b = curr
+
+    assert isinstance(block, FullBlock)
+    if len(block.finished_sub_slots) > 0 and (
+        block.finished_sub_slots[0].challenge_chain.new_sub_slot_iters is not None
+        or block.finished_sub_slots[0].challenge_chain.new_difficulty is not None
+    ):
+        expected_ssi, expected_difficulty = get_next_sub_slot_iters_and_difficulty(constants, True, prev_b, blockchain)
+        expected_vs = ValidationState(expected_ssi, expected_difficulty, vs.prev_ses_block)
+    else:
+        expected_vs = ValidationState(vs.ssi, vs.difficulty, vs.prev_ses_block)
+    overflow = is_overflow_block(constants, block.reward_chain_block.signage_point_index)
+    challenge = get_block_challenge(constants, block, blockchain, prev_b is None, overflow, False)
+    if block.reward_chain_block.challenge_chain_sp_vdf is None:
+        cc_sp_hash: bytes32 = challenge
+    else:
+        cc_sp_hash = block.reward_chain_block.challenge_chain_sp_vdf.output.get_hash()
+
+    filter_challenge = None
+    if block.reward_chain_block.proof_of_space.version == 1:
+        filter_challenge = get_filter_challenge_from_chain(
+            constants,
+            blockchain,
+            block,
+            challenge,
+            block.reward_chain_block.signage_point_index,
+        )
+
+    prev_tx_height = pre_sp_tx_block_height(
+        constants=constants,
+        blocks=blockchain,
+        prev_b_hash=block.prev_header_hash,
+        sp_index=block.reward_chain_block.signage_point_index,
+        finished_sub_slots=len(block.finished_sub_slots),
+    )
+    required_iters = validate_pospace_and_get_required_iters(
+        constants,
+        block.reward_chain_block.proof_of_space,
+        challenge,
+        cc_sp_hash,
+        block.height,
+        expected_vs.difficulty,
+        prev_tx_height,
+        filter_challenge=filter_challenge,
+        signage_point_index=block.reward_chain_block.signage_point_index,
+    )
+    if required_iters is None:
+        return return_error(Err.INVALID_POSPACE)
+
+    if block.transactions_info is None:
+        if block_has_transactions_generator(block) or block.transactions_generator_ref_list != []:
+            error = (
+                Err.IS_TRANSACTION_BLOCK_BUT_NO_DATA
+                if block.foliage.foliage_transaction_block_hash is not None
+                else Err.NOT_BLOCK_BUT_HAS_DATA
+            )
+            return return_error(error)
+    else:
+        generator_ref_error = validate_generator_ref_list(constants, block, block.height, prev_tx_height)
+        if generator_ref_error is not None:
+            return return_error(generator_ref_error)
+
+    try:
+        block_rec = block_to_block_record(
+            constants,
+            blockchain,
+            required_iters,
+            block,
+            sub_slot_iters=expected_vs.ssi,
+            prev_ses_block=expected_vs.prev_ses_block,
+        )
+    except ValueError:
+        log.exception("block_to_block_record()")
+        return return_error(Err.INVALID_SUB_EPOCH_SUMMARY)
+
+    if block_rec.sub_epoch_summary_included is not None and wp_summaries is not None:
+        next_ses = wp_summaries[int(block.height / constants.SUB_EPOCH_BLOCKS) - 1]
+        if not block_rec.sub_epoch_summary_included.get_hash() == next_ses.get_hash():
+            log.error("sub_epoch_summary does not match wp sub_epoch_summary list")
+            return return_error(Err.INVALID_SUB_EPOCH_SUMMARY)
+
+    previous_generators: list[bytes] | None = None
+
+    try:
+        generator_started = time.monotonic()
+        block_generator: BlockGenerator | None = await get_block_generator(blockchain.lookup_block_generators, block)
+        if phase_times is not None:
+            phase_times["generator_read"] = time.monotonic() - generator_started
+        if block_generator is not None:
+            previous_generators = block_generator.generator_refs
+    except ValueError:
+        return return_error(Err.FAILED_GETTING_GENERATOR_MULTIPROCESSING)
+
+    blockchain.add_extra_block(block, block_rec)  # Temporarily add block to chain
+    readonly_blockchain = blockchain.read_only_snapshot()
+    # Later blocks in this batch update ``expected_vs``. A check that waits for
+    # math already running must keep the state from this block.
+    worker_vs = copy.copy(expected_vs) if math_futures else expected_vs
+
+    def start_check() -> Awaitable[PreValidationResult]:
+        return pool.run_in_loop(
+            _pre_validate_block,
+            constants,
+            readonly_blockchain,
+            block,
+            previous_generators,
+            conds,
+            prev_tx_height,
+            worker_vs,
+            skip_commitment_validation=skip_commitment_validation,
+            phase_times=phase_times,
+            nice=nice,
+            dedicated=dedicated,
+        )
+
+    if math_futures:
+        pending_math = tuple(math_futures)
+
+        async def check_after_math() -> PreValidationResult:
+            await _await_block_math(pending_math, phase_times, int(block.height))
+            return await start_check()
+
+        future: Awaitable[PreValidationResult] = asyncio.ensure_future(check_after_math())
+    else:
+        future = start_check()
+
+    if block_rec.sub_epoch_summary_included is not None:
+        vs.prev_ses_block = block_rec
+        if block_rec.sub_epoch_summary_included.new_difficulty is not None:
+            vs.difficulty = block_rec.sub_epoch_summary_included.new_difficulty
+        if block_rec.sub_epoch_summary_included.new_sub_slot_iters is not None:
+            vs.ssi = block_rec.sub_epoch_summary_included.new_sub_slot_iters
+
+    return future

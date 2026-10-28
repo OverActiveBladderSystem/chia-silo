@@ -1,0 +1,138 @@
+from __future__ import annotations
+
+import logging
+import threading
+import traceback
+from collections import OrderedDict
+from enum import IntEnum
+from functools import lru_cache
+
+from chia_rs import ConsensusConstants, VDFInfo, VDFProof
+from chia_rs.sized_bytes import bytes32, bytes100
+from chia_rs.sized_ints import uint8, uint64
+from chiavdf import create_discriminant, verify_n_wesolowski
+
+from chia.types.blockchain_format.classgroup import ClassgroupElement
+
+log = logging.getLogger(__name__)
+
+__all__ = ["VDFInfo", "VDFProof"]
+
+
+# One build per challenge. lru_cache lets every thread that arrives together run the
+# build, and validation does that on every batch. Different challenges still run together.
+# A long sync holds several hundred blocks between the early build and the check, and a
+# block adds more than one reward-chain challenge. 1024 dropped that early number before
+# its turn. Each saved value is one 1024-bit integer.
+_DISCRIMINANT_CACHE_SIZE = 4096
+_discriminant_lock = threading.Lock()
+_discriminant_ready: OrderedDict[tuple[bytes, int], int] = OrderedDict()
+_discriminant_inflight: dict[tuple[bytes, int], threading.Event] = {}
+
+
+def get_discriminant(challenge: bytes32, size_bites: int) -> int:
+    key = (bytes(challenge), size_bites)
+    with _discriminant_lock:
+        cached = _discriminant_ready.get(key)
+        if cached is not None:
+            _discriminant_ready.move_to_end(key)
+            return cached
+        pending = _discriminant_inflight.get(key)
+        if pending is None:
+            pending = threading.Event()
+            _discriminant_inflight[key] = pending
+            owner = True
+        else:
+            owner = False
+    if not owner:
+        pending.wait()
+        with _discriminant_lock:
+            cached = _discriminant_ready.get(key)
+        if cached is None:
+            return get_discriminant(challenge, size_bites)
+        return cached
+    try:
+        value = int(create_discriminant(challenge, size_bites), 16)
+    except BaseException:
+        with _discriminant_lock:
+            _discriminant_inflight.pop(key, None)
+        pending.set()
+        raise
+    with _discriminant_lock:
+        _discriminant_ready[key] = value
+        _discriminant_ready.move_to_end(key)
+        while len(_discriminant_ready) > _DISCRIMINANT_CACHE_SIZE:
+            _discriminant_ready.popitem(last=False)
+        _discriminant_inflight.pop(key, None)
+    pending.set()
+    return value
+
+
+@lru_cache(maxsize=1000)
+def verify_vdf(
+    disc: int,
+    input_el: bytes100,
+    output: bytes,
+    number_of_iterations: uint64,
+    discriminant_size: int,
+    witness_type: uint8,
+) -> bool:
+    # TODO: chiavdf needs hinted
+    return verify_n_wesolowski(  # type:ignore[no-any-return]
+        str(disc),
+        input_el,
+        output,
+        number_of_iterations,
+        discriminant_size,
+        witness_type,
+    )
+
+
+def validate_vdf(
+    proof: VDFProof,
+    constants: ConsensusConstants,
+    input_el: ClassgroupElement,
+    info: VDFInfo,
+    target_vdf_info: VDFInfo | None = None,
+) -> bool:
+    """
+    If target_vdf_info is passed in, it is compared with info.
+    """
+    if target_vdf_info is not None and info != target_vdf_info:
+        tb = traceback.format_stack()
+        log.error(f"{tb} INVALID VDF INFO. Have: {info} Expected: {target_vdf_info}")
+        return False
+    if proof.witness_type + 1 > constants.MAX_VDF_WITNESS_SIZE:
+        return False
+    # A witness holds one serialized classgroup element followed by one segment per
+    # level of recursion. Each segment stores an iteration count, a 264-bit challenge
+    # prime (33 bytes), and another classgroup element.
+    form_size = ClassgroupElement.get_size()
+    witness_segment_size = uint64.SIZE + 33 + form_size
+    expected_witness_size = form_size + proof.witness_type * witness_segment_size
+    if len(proof.witness) != expected_witness_size:
+        return False
+    if len(input_el.data) != 100:
+        log.error(f"Invalid ClassgroupElement size: {len(input_el.data)} (expected 100)")
+        return False
+    try:
+        disc: int = get_discriminant(info.challenge, constants.DISCRIMINANT_SIZE_BITS)
+        # TODO: parallelize somehow, this might included multiple mini proofs (n weso)
+        return verify_vdf(
+            disc,
+            input_el.data,
+            info.output.data + bytes(proof.witness),
+            info.number_of_iterations,
+            constants.DISCRIMINANT_SIZE_BITS,
+            proof.witness_type,
+        )
+    except Exception:
+        return False
+
+
+# Stores, for a given VDF, the field that uses it.
+class CompressibleVDFField(IntEnum):
+    CC_EOS_VDF = 1
+    ICC_EOS_VDF = 2
+    CC_SP_VDF = 3
+    CC_IP_VDF = 4

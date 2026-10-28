@@ -1,0 +1,494 @@
+from __future__ import annotations
+
+import platform
+import random
+from collections.abc import Callable, Iterator
+from typing import Any
+
+import pytest
+from chia_rs import (
+    ChallengeChainSubSlot,
+    EndOfSubSlotBundle,
+    Foliage,
+    FoliageBlockData,
+    FoliageTransactionBlock,
+    FullBlock,
+    G1Element,
+    G2Element,
+    HeaderBlock,
+    InfusedChallengeChainSubSlot,
+    PoolTarget,
+    Program,
+    ProofOfSpace,
+    RewardChainBlock,
+    RewardChainSubSlot,
+    SubSlotProofs,
+    TransactionsInfo,
+)
+from chia_rs.sized_bytes import bytes32
+from chia_rs.sized_ints import uint8, uint16, uint32, uint64, uint128
+
+from chia._tests.util.benchmarks import rand_g1, rand_g2, rand_hash, rand_vdf, rand_vdf_proof, rewards
+from chia.consensus.generator_tools import get_block_header
+from chia.full_node.full_block_utils import (
+    block_info_from_block,
+    generator_from_block,
+    get_height_and_tx_status_from_block,
+    header_block_from_block,
+    skip_bytes,
+    skip_list,
+    skip_reward_chain_block,
+)
+from chia.types.blockchain_format.serialized_program import SerializedProgram
+from chia.types.blockchain_format.vdf import VDFInfo, VDFProof
+
+test_g2s: list[G2Element] = [rand_g2() for _ in range(10)]
+test_g1s: list[G1Element] = [rand_g1() for _ in range(10)]
+test_hashes: list[bytes32] = [rand_hash() for _ in range(100)]
+test_vdfs: list[VDFInfo] = [rand_vdf() for _ in range(100)]
+test_vdf_proofs: list[VDFProof] = [rand_vdf_proof() for _ in range(100)]
+
+
+def _is_macos_intel() -> bool:
+    """True when running on macOS with an Intel CPU (x86_64). Used to skip slow test params."""
+    return platform.system() == "Darwin" and platform.machine() in {"x86_64", "i386"}
+
+
+def g2() -> G2Element:
+    return random.sample(test_g2s, 1)[0]
+
+
+def g1() -> G1Element:
+    return random.sample(test_g1s, 1)[0]
+
+
+def hsh() -> bytes32:
+    return random.sample(test_hashes, 1)[0]
+
+
+def vdf() -> VDFInfo:
+    return random.sample(test_vdfs, 1)[0]
+
+
+def vdf_proof() -> VDFProof:
+    return random.sample(test_vdf_proofs, 1)[0]
+
+
+def get_proof_of_space() -> Iterator[ProofOfSpace]:
+    for pool_pk, plot_hash in [(g1(), None), (None, hsh())]:
+        yield ProofOfSpace(
+            hsh(),  # challenge
+            pool_pk,
+            plot_hash,
+            g1(),  # plot_public_key
+            uint8(0),  # version
+            uint16(0),  # plot_index (not used for v1)
+            uint8(0),  # group_id (not used for v1)
+            uint8(0),  # strength (not used for v1)
+            uint8(32),  # this is k-size
+            random.randbytes(8 * 32),
+        )
+        yield ProofOfSpace(
+            hsh(),  # challenge
+            pool_pk,
+            plot_hash,
+            g1(),  # plot_public_key
+            uint8(1),  # version
+            uint16(123),  # plot_index
+            uint8(21),  # group_id
+            uint8(4),  # strength
+            uint8(0),  # not used for v2
+            random.randbytes(8 * 32),
+        )
+
+
+def get_reward_chain_block(height: uint32) -> Iterator[RewardChainBlock]:
+    for has_transactions in [True, False]:
+        for challenge_chain_sp_vdf in [vdf(), None]:
+            for reward_chain_sp_vdf in [vdf(), None]:
+                for infused_challenge_chain_ip_vdf in [vdf(), None]:
+                    for mmr_root in [hsh(), None]:
+                        for proof_of_space in get_proof_of_space():
+                            weight = uint128(random.randint(0, 1000000000))
+                            iters = uint128(123456)
+                            sp_index = uint8(0)
+                            yield RewardChainBlock(
+                                weight,
+                                uint32(height),
+                                iters,
+                                sp_index,
+                                hsh(),  # pos_ss_cc_challenge_hash
+                                proof_of_space,
+                                challenge_chain_sp_vdf,
+                                g2(),  # challenge_chain_sp_signature
+                                vdf(),  # challenge_chain_ip_vdf
+                                reward_chain_sp_vdf,
+                                g2(),  # reward_chain_sp_signature
+                                vdf(),  # reward_chain_ip_vdf
+                                infused_challenge_chain_ip_vdf,
+                                mmr_root,
+                                has_transactions,
+                            )
+
+
+@pytest.mark.parametrize(("has_icc", "has_mmr_root"), [(False, False), (False, True), (True, False), (True, True)])
+def test_skip_reward_chain_block_handles_combined_optional_tag(has_icc: bool, has_mmr_root: bool) -> None:
+    reward_chain_block = next(get_reward_chain_block(uint32(100))).replace(
+        infused_challenge_chain_ip_vdf=vdf() if has_icc else None,
+        header_mmr_root=hsh() if has_mmr_root else None,
+    )
+    # The helper should consume exactly one serialized RewardChainBlock.
+    assert len(skip_reward_chain_block(memoryview(bytes(reward_chain_block)))) == 0
+
+
+def test_skip_list_rejects_count_exceeding_remaining_buffer() -> None:
+    with pytest.raises(ValueError, match="list count 2 exceeds remaining buffer 1"):
+        skip_list(memoryview((2).to_bytes(4, "big") + b"\x00"), skip_bytes)
+
+
+def test_skip_list_rejects_short_count_prefix() -> None:
+    with pytest.raises(ValueError, match="list count prefix requires 4 bytes, remaining buffer 1"):
+        skip_list(memoryview(b"\x00"), skip_bytes)
+
+
+def test_skip_bytes_rejects_length_exceeding_remaining_buffer() -> None:
+    with pytest.raises(ValueError, match="byte length 4 exceeds remaining buffer 3"):
+        skip_bytes(memoryview((4).to_bytes(4, "big") + b"abc"))
+
+
+def test_skip_bytes_rejects_short_length_prefix() -> None:
+    with pytest.raises(ValueError, match="byte length prefix requires 4 bytes, remaining buffer 1"):
+        skip_bytes(memoryview(b"\x00"))
+
+
+def get_foliage_block_data() -> Iterator[FoliageBlockData]:
+    for pool_signature in [g2(), None]:
+        pool_target = PoolTarget(
+            hsh(),  # puzzle_hash
+            uint32(0),  # max_height
+        )
+
+        yield FoliageBlockData(
+            hsh(),  # unfinished_reward_block_hash
+            pool_target,
+            pool_signature,  # pool_signature
+            hsh(),  # farmer_reward_puzzle_hash
+            hsh(),  # extension_data
+        )
+
+
+# there are 4 shards, each representing a subset of all combinations of Foliage
+# objects.
+def get_foliage(shard: int) -> Iterator[Foliage]:
+    assert shard >= 0
+    assert shard < 4
+    for foliage_block_data in get_foliage_block_data():
+        # rather than generating these 4 combinations, serially, as part of the
+        # generator output, we pin these based on which shard we're on.
+        # these two fields, tx block hash and tc block signature are both optional,
+        # so we cover all 4 combinations where they are set or not.
+        foliage_transaction_block_hash = None if (shard & 1) == 0 else hsh()
+        foliage_transaction_block_signature = None if (shard & 2) == 0 else g2()
+        yield Foliage(
+            hsh(),  # prev_block_hash
+            hsh(),  # reward_block_hash
+            foliage_block_data,
+            g2(),  # foliage_block_data_signature
+            foliage_transaction_block_hash,
+            foliage_transaction_block_signature,
+        )
+
+
+def get_foliage_transaction_block() -> Iterator[FoliageTransactionBlock | None]:
+    yield None
+    timestamp = uint64(1631794488)
+    yield FoliageTransactionBlock(
+        hsh(),  # prev_transaction_block
+        timestamp,
+        hsh(),  # filter_hash
+        hsh(),  # additions_root
+        hsh(),  # removals_root
+        hsh(),  # transactions_info_hash
+    )
+
+
+def get_transactions_info(
+    height: uint32, foliage_transaction_block: FoliageTransactionBlock | None
+) -> Iterator[TransactionsInfo | None]:
+    if not foliage_transaction_block:
+        yield None
+    else:
+        farmer_coin, pool_coin = rewards(uint32(height))
+        reward_claims_incorporated = [farmer_coin, pool_coin]
+        fees = uint64(random.randint(0, 150000))
+        yield TransactionsInfo(
+            hsh(),  # generator_root
+            hsh(),  # generator_refs_root
+            g2(),  # aggregated_signature
+            fees,
+            uint64(random.randint(0, 12000000000)),  # cost
+            reward_claims_incorporated,
+        )
+
+
+def get_challenge_chain_sub_slot() -> Iterator[ChallengeChainSubSlot]:
+    for infused_chain_sub_slot_hash in [hsh(), None]:
+        for sub_epoch_summary_hash in [hsh(), None]:
+            for new_sub_slot_iters in [uint64(random.randint(0, 4000000000)), None]:
+                for new_difficulty in [uint64(random.randint(1, 30)), None]:
+                    yield ChallengeChainSubSlot(
+                        vdf(),  # challenge_chain_end_of_slot_vdf
+                        infused_chain_sub_slot_hash,
+                        sub_epoch_summary_hash,
+                        new_sub_slot_iters,
+                        new_difficulty,
+                    )
+
+
+def get_reward_chain_sub_slot() -> Iterator[RewardChainSubSlot]:
+    for infused_challenge_chain_sub_slot_hash in [hsh(), None]:
+        yield RewardChainSubSlot(
+            vdf(),  # end_of_slot_vdf
+            hsh(),  # challenge_chain_sub_slot_hash
+            infused_challenge_chain_sub_slot_hash,
+            uint8(random.randint(0, 255)),  # deficit
+        )
+
+
+def get_sub_slot_proofs() -> Iterator[SubSlotProofs]:
+    for infused_challenge_chain_slot_proof in [vdf_proof(), None]:
+        yield SubSlotProofs(
+            vdf_proof(),  # challenge_chain_slot_proof
+            infused_challenge_chain_slot_proof,
+            vdf_proof(),  # reward_chain_slot_proof
+        )
+
+
+def get_end_of_sub_slot() -> Iterator[EndOfSubSlotBundle]:
+    for challenge_chain in get_challenge_chain_sub_slot():
+        for infused_challenge_chain in [InfusedChallengeChainSubSlot(vdf()), None]:
+            for reward_chain in get_reward_chain_sub_slot():
+                for proofs in get_sub_slot_proofs():
+                    yield EndOfSubSlotBundle(
+                        challenge_chain,
+                        infused_challenge_chain,
+                        reward_chain,
+                        proofs,
+                    )
+
+
+def get_finished_sub_slots() -> Iterator[list[EndOfSubSlotBundle]]:
+    yield []
+    yield [s for s in get_end_of_sub_slot()]
+
+
+def get_ref_list() -> Iterator[list[uint32]]:
+    yield []
+    yield [uint32(1), uint32(2), uint32(3), uint32(4)]
+    yield [uint32(0xFFFFFFFF)]
+
+
+# This generator creates (essentially) all combinations of fields set and unset
+# (including invalid combinations) of FullBlock. It's broken down into multiple
+# generators that in turn generate all combinations of sub objects. Since there
+# are many combinations, tests that use this take a long time. To allow tests
+# running in parallel, the outer loop (creating all combinations of foliage) is
+# split into 4 shards that allow the tests to run in parallel, 4-ways.
+def get_full_blocks(shard: int) -> Iterator[FullBlock]:
+    random.seed(123456789)
+
+    generator = SerializedProgram.from_bytes(bytes.fromhex("ff01820539"))
+
+    for foliage in get_foliage(shard):
+        for foliage_transaction_block in get_foliage_transaction_block():
+            height = uint32(random.randint(0, 1000000))
+            for reward_chain_block in get_reward_chain_block(height):
+                for transactions_info in get_transactions_info(height, foliage_transaction_block):
+                    for challenge_chain_sp_proof in [vdf_proof(), None]:
+                        for reward_chain_sp_proof in [vdf_proof(), None]:
+                            for infused_challenge_chain_ip_proof in [vdf_proof(), None]:
+                                for finished_sub_slots in get_finished_sub_slots():
+                                    for refs_list in get_ref_list():
+                                        for gen in [None, generator]:
+                                            for version in [0, 1]:
+                                                yield FullBlock(
+                                                    finished_sub_slots,
+                                                    reward_chain_block,
+                                                    challenge_chain_sp_proof,
+                                                    vdf_proof(),  # challenge_chain_ip_proof
+                                                    reward_chain_sp_proof,
+                                                    vdf_proof(),  # reward_chain_ip_proof
+                                                    infused_challenge_chain_ip_proof,
+                                                    foliage,
+                                                    foliage_transaction_block,
+                                                    transactions_info,
+                                                    gen if version == 0 and gen else None,  # transactions_generator
+                                                    refs_list
+                                                    if version == 0
+                                                    else [],  # transactions_generator_ref_list
+                                                    bytes(gen)
+                                                    if version == 1 and gen
+                                                    else None,  # transactions_generator_buffer
+                                                    uint8(version),
+                                                )
+
+
+def test_block_info_from_block_rejects_refs_count_exceeding_remaining_buffer() -> None:
+    block_bytes = bytearray(bytes(next(get_full_blocks(0))))
+    block_bytes[-4:] = (1).to_bytes(4, "big")
+
+    with pytest.raises(ValueError, match="refs count 1 exceeds remaining buffer 0"):
+        block_info_from_block(memoryview(block_bytes))
+
+
+def test_block_info_from_block_rejects_short_refs_count_prefix() -> None:
+    block_bytes = bytearray(bytes(next(get_full_blocks(0))))
+    del block_bytes[-3:]
+
+    with pytest.raises(ValueError, match="refs count prefix requires 4 bytes, remaining buffer 1"):
+        block_info_from_block(memoryview(block_bytes))
+
+
+def _version1_block_bytes_with_generator_buffer() -> tuple[bytearray, int]:
+    for block in get_full_blocks(0):
+        if block.version == 1 and block.transactions_generator_buffer is not None:
+            return bytearray(bytes(block)), len(block.transactions_generator_buffer)
+    raise AssertionError("expected a version-1 block with transactions_generator_buffer")
+
+
+@pytest.mark.parametrize("parse", [generator_from_block, block_info_from_block])
+def test_cheap_parser_rejects_short_generator_buffer_length_prefix(parse: Callable[[memoryview], Any]) -> None:
+    block_bytes, buf_len = _version1_block_bytes_with_generator_buffer()
+    # Trailing layout: discriminant (1) + length (4) + buffer. Leave discriminant + 1 length byte.
+    del block_bytes[-(buf_len + 3) :]
+
+    with pytest.raises(ValueError, match="generator_buffer length prefix requires 4 bytes, remaining buffer 1"):
+        parse(memoryview(block_bytes))
+
+
+@pytest.mark.parametrize("parse", [generator_from_block, block_info_from_block])
+def test_cheap_parser_rejects_generator_buffer_length_exceeding_remaining_buffer(
+    parse: Callable[[memoryview], Any],
+) -> None:
+    block_bytes, buf_len = _version1_block_bytes_with_generator_buffer()
+    length_offset = len(block_bytes) - buf_len - 4
+    block_bytes[length_offset : length_offset + 4] = (buf_len + 1).to_bytes(4, "big")
+
+    with pytest.raises(ValueError, match=f"generator_buffer length: {buf_len + 1}, exceeds remaining buffer {buf_len}"):
+        parse(memoryview(block_bytes))
+
+
+@pytest.mark.parametrize("parse", [generator_from_block, block_info_from_block])
+def test_cheap_parser_rejects_invalid_generator_version(parse: Callable[[memoryview], Any]) -> None:
+    block_bytes, buf_len = _version1_block_bytes_with_generator_buffer()
+    # Present bit set with version 2 (unsupported).
+    block_bytes[-(buf_len + 4 + 1)] = (2 << 1) | 1
+
+    with pytest.raises(ValueError, match="invalid FullBlock generator version: 2"):
+        parse(memoryview(block_bytes))
+
+
+@pytest.mark.parametrize("version", [0, 1])
+def test_cheap_parser_reads_present_generator_for_supported_versions(version: int) -> None:
+    for block in get_full_blocks(0):
+        if block.version != version:
+            continue
+        if version == 0 and block.transactions_generator is None:
+            continue
+        if version == 1 and block.transactions_generator_buffer is None:
+            continue
+
+        block_bytes = memoryview(bytes(block))
+        gen = generator_from_block(block_bytes)
+        assert gen is not None
+        if version == 0:
+            assert Program.from_bytes(gen) == block.transactions_generator
+        else:
+            assert gen == block.transactions_generator_buffer
+
+        block_info = block_info_from_block(block_bytes)
+        assert block_info.version == version
+        assert block_info.transactions_generator == block.transactions_generator
+        assert block_info.transactions_generator_buffer == block.transactions_generator_buffer
+        assert block_info.transactions_generator_ref_list == block.transactions_generator_ref_list
+        return
+
+    raise AssertionError(f"expected a version-{version} block with a present generator")
+
+
+def test_cheap_parser_matches_round_tripped_block() -> None:
+    block = next(get_full_blocks(0))
+    block_bytes = memoryview(bytes(block))
+    round_tripped = FullBlock.from_bytes(block_bytes)
+
+    height, is_tx_block = get_height_and_tx_status_from_block(block_bytes)
+    assert height == round_tripped.height
+    assert is_tx_block == round_tripped.is_transaction_block()
+    assert generator_from_block(block_bytes) is None
+
+    block_info = block_info_from_block(block_bytes)
+    assert block_info.prev_header_hash == round_tripped.prev_header_hash
+    assert block_info.transactions_generator == round_tripped.transactions_generator
+    assert block_info.transactions_generator_ref_list == round_tripped.transactions_generator_ref_list
+
+    header_block = HeaderBlock.from_bytes(header_block_from_block(block_bytes))
+    assert header_block == get_block_header(round_tripped, None)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("shard", [0, 1, 2, 3])
+@pytest.mark.skipif(_is_macos_intel(), reason="Very slow on macOS Intel")
+async def test_parser(shard: int) -> None:
+    # loop over every combination of Optionals being set and not set
+    # along with random values for the FullBlock fields. Ensure
+    # generator_from_block() successfully parses out the generator object
+    # correctly
+    for block in get_full_blocks(shard):
+        block_bytes = memoryview(bytes(block))
+        height, is_tx_block = get_height_and_tx_status_from_block(block_bytes)
+        assert height == block.height
+        assert is_tx_block == block.is_transaction_block()
+        gen = generator_from_block(block_bytes)
+        if gen is None:
+            assert block.transactions_generator is None
+            assert block.transactions_generator_buffer is None
+        elif block.version == 0:
+            assert block.transactions_generator is not None
+            assert Program.from_bytes(gen) == block.transactions_generator
+        else:
+            assert block.version == 1
+            assert block.transactions_generator_buffer is not None
+            assert gen == block.transactions_generator_buffer
+        bi = block_info_from_block(block_bytes)
+        if block.transactions_generator is None:
+            assert bi.transactions_generator is None
+        else:
+            assert block.transactions_generator == bi.transactions_generator
+        if block.transactions_generator_buffer is None:
+            assert bi.transactions_generator_buffer is None
+        else:
+            assert block.transactions_generator_buffer == bi.transactions_generator_buffer
+        assert block.prev_header_hash == bi.prev_header_hash
+        assert block.transactions_generator_ref_list == bi.transactions_generator_ref_list
+        # this doubles the run-time of this test, with questionable utility
+        round_trip = FullBlock.from_bytes(block_bytes)
+        if gen is None:
+            assert round_trip.transactions_generator is None
+            assert round_trip.transactions_generator_buffer is None
+        elif round_trip.version == 0:
+            assert round_trip.transactions_generator_buffer is None
+            assert Program.from_bytes(gen) == round_trip.transactions_generator
+        else:
+            assert round_trip.version == 1
+            assert round_trip.transactions_generator is None
+            assert gen == round_trip.transactions_generator_buffer
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("shard", [0, 1, 2, 3])
+@pytest.mark.skipif(_is_macos_intel(), reason="Very slow on macOS Intel")
+async def test_header_block(shard: int) -> None:
+    for block in get_full_blocks(shard):
+        hb: HeaderBlock = get_block_header(block, ([], []) if block.is_transaction_block() else None)
+        hb_bytes = header_block_from_block(memoryview(bytes(block)))
+        assert HeaderBlock.from_bytes(hb_bytes) == hb
